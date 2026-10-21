@@ -45,7 +45,11 @@ def check_sources(args, now: datetime) -> int:
                 for v in found[:3]:
                     print(f'   {v.posted} {v.title} — {v.company}')
                 continue
-            verdicts = classifier.classify_many(found)
+            try:
+                verdicts = classifier.classify_many(found)
+            except Exception as exc:  # неверный ключ, нет доступа к модели — дальше проверять бессмысленно
+                print(f'Ошибка классификатора ({type(exc).__name__}): {exc}', file=sys.stderr)
+                return 1
             for v in sorted(found, key=lambda v: -(verdicts[v.key].probability or 0)):
                 vd = verdicts[v.key]
                 decision = vd.decision(classifier.keep, classifier.drop)
@@ -89,7 +93,11 @@ def main() -> int:
         sheet_id, creds = env('GOOGLE_SHEET_ID'), env('GOOGLE_CREDENTIALS', 'service-account.json')
         if not sheet_id:
             parser.error('для --sheets задайте GOOGLE_SHEET_ID в .env')
-        store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии')), 'Google Sheets'
+        try:
+            store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии')), 'Google Sheets'
+        except Exception as exc:  # нет доступа, неверный ID, несовместимые колонки
+            print(f'Google Sheets ({type(exc).__name__}): {exc}', file=sys.stderr)
+            return 1
     else:
         store, target = CsvStore(args.output), str(Path(args.output).resolve())
 
@@ -97,6 +105,11 @@ def main() -> int:
     print(f'Классификатор: {classifier.model}, пороги {classifier.keep}/{classifier.drop}, '
           f'спорные: {"сохранять с пометкой «проверить»" if review == "save" else "отбрасывать"}. '
           f'Результаты: {target}', flush=True)
+    try:
+        store.known_urls()  # несовместимый CSV/лист — ошибка до первых запросов к сайтам и API
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     try:
         _, total = run_classifier(store, args.cities, args.sources, now, classifier,
                                   fetcher=Fetcher(delay=args.delay, proxy=env('PROXY_URL')),

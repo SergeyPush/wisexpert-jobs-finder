@@ -78,7 +78,9 @@ class StorageTest(unittest.TestCase):
             path = Path(d) / 'jobs.csv'
             path.write_text('Найдено,Ссылка\nx,https://x/1\n', encoding='utf-8-sig')
             store = CsvStore(str(path))
-            self.assertEqual(store.known_urls(), {'https://x/1'})
+            # Несовместимый файл обнаруживается уже при чтении, до запросов к API.
+            with self.assertRaises(RuntimeError):
+                store.known_urls()
             with self.assertRaises(RuntimeError):
                 store.append([['row']])
 
@@ -148,6 +150,27 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((total['found'], total['saved'], total['review'], total['dropped']), (4, 1, 1, 1))
         self.assertIn('новых 3', report[0])
 
+    def test_classifier_error_kept_even_with_drop(self):
+        import job_agent.pipeline as pipeline
+        from job_agent.classifier import Verdict
+        from job_agent.sources import Vacancy
+        vac = Vacancy('work:7', 'work.ua', 'Киев', 'Бухгалтер', 'Ко', '', '2026-10-20T10:00+03:00',
+                      'https://www.work.ua/jobs/7/', 'описание')
+
+        class Failing(FakeClassifier):
+            def classify_many(self, vacancies):
+                return {v.key: Verdict(None, error='RateLimitError') for v in vacancies}
+
+        store = FakeStore()
+        original = pipeline.search
+        pipeline.search = lambda *a: [vac]
+        try:
+            _, total = pipeline.run_classifier(store, ['Киев'], ['work.ua'], NOW, Failing({}), fetcher=None, review='drop')
+        finally:
+            pipeline.search = original
+        self.assertEqual(store.rows[0][-2], 'проверить')
+        self.assertEqual(total['dropped'], 0)
+
     def test_review_dropped(self):
         store, _, total = self.run_pipeline('drop')
         self.assertEqual(len(store.rows), 1)
@@ -165,12 +188,127 @@ class SnapshotTest(unittest.TestCase):
             raw, scored = Path(d) / 'before.csv', Path(d) / 'after.csv'
             write_snapshot(str(raw), [(vac, None, '')], with_verdicts=False)
             write_snapshot(str(scored), [(vac, Verdict(0.93, 'главбух/зам'), 'подходит')], with_verdicts=True)
-            raw_rows = list(csv.reader(raw.open(encoding='utf-8-sig')))
-            scored_rows = list(csv.reader(scored.open(encoding='utf-8-sig')))
+            raw_rows = list(csv.reader(raw.read_text(encoding='utf-8-sig').splitlines()))
+            scored_rows = list(csv.reader(scored.read_text(encoding='utf-8-sig').splitlines()))
         self.assertEqual(raw_rows[0][-1], 'Ссылка')
         self.assertEqual(raw_rows[1][-1], vac.url)
         self.assertEqual(scored_rows[0][-4:], ['Вероятность', 'Уровень', 'Решение', 'Ошибка'])
         self.assertEqual(scored_rows[1][-4:], ['0.93', 'главбух/зам', 'подходит', ''])
+
+
+def work_card(job_id, when=None, title='Бухгалтер', hot_date=None):
+    """HTML одной карточки выдачи work.ua: обычной (с <time>) или «гарячої» (только дата в title)."""
+    attr = f' title="{title}, вакансія від {hot_date}"' if hot_date else ''
+    time_tag = f'<time datetime="{when}">x</time>' if when else ''
+    return (f'<div tabindex="0" class="card card-hover card-visited wordwrap job-link">'
+            f'<h2><a href="/jobs/{job_id}/"{attr}>{title}</a></h2>{time_tag}</div>')
+
+
+class FakeFetcher:
+    """Отдаёт заранее заданные страницы и запоминает запрошенные URL."""
+
+    def __init__(self, pages):
+        self.pages, self.urls = pages, []
+
+    def get(self, url):
+        from types import SimpleNamespace as NS
+        self.urls.append(url)
+        page = int(url.rsplit('page=', 1)[1])
+        return NS(text=self.pages.get(page, ''))
+
+
+class SearchWorkTest(unittest.TestCase):
+    def test_skips_hot_pages_and_stops_at_old_card(self):
+        from job_agent.sources import search_work
+        pages = {
+            # Стр. 1: только «гарячі» — старая (не берём) и сегодняшняя (берём), дальше идём.
+            1: work_card(1, hot_date='16 жовтня 2026') + work_card(2, hot_date='20 жовтня 2026') + 'page=2',
+            # Стр. 2: свежая и старая обычные — берём свежую и останавливаемся, хотя есть page=3.
+            2: work_card(3, '2026-10-20 12:00:00') + work_card(4, '2026-10-18 12:00:00') + 'page=3',
+            3: work_card(5, '2026-10-20 13:00:00'),
+        }
+        fetcher = FakeFetcher(pages)
+        found = search_work(fetcher, 'Киев', NOW, max_pages=10)
+        self.assertEqual(sorted(v.key for v in found), ['work:2', 'work:3'])
+        self.assertEqual(len(fetcher.urls), 2)
+
+    def test_empty_first_page_is_error_unless_not_found(self):
+        from job_agent.sources import SourceError, search_work
+        with self.assertRaises(SourceError):
+            search_work(FakeFetcher({1: '<html>капча</html>'}), 'Киев', NOW)
+        self.assertEqual(search_work(FakeFetcher({1: 'Вакансій не знайдено'}), 'Киев', NOW), [])
+
+    def test_bad_robota_card_is_skipped(self):
+        import contextlib
+        import io
+        data = {'documents': [{'id': 1, 'cityId': 1, 'name': 'Бухгалтер'},  # нет date/notebookId
+                              {'id': 2, 'notebookId': 9, 'name': 'Бухгалтер', 'cityId': 1, 'date': '2026-10-20T15:01:00'}]}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            cards = parse_robota_search(data, 'Киев')
+        self.assertEqual([c[0].key for c in cards], ['robota:2'])
+        self.assertIn('пропущена карточка 1', err.getvalue())
+
+
+class FetcherTest(unittest.TestCase):
+    def make(self, responses):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+
+        from job_agent.sources import Fetcher
+        f = Fetcher(delay=0)
+        f.session = mock.MagicMock()
+        f.session.get.side_effect = [NS(status_code=c, text=t) for c, t in responses]
+        return f
+
+    def test_retries_cloudflare_then_succeeds(self):
+        from unittest import mock
+        f = self.make([(200, '<title>Just a moment...</title>'), (200, 'ok')])
+        with mock.patch('time.sleep') as sleep:
+            self.assertEqual(f.get('https://x').text, 'ok')
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_404_fails_fast_and_no_sleep_after_last_attempt(self):
+        from unittest import mock
+
+        from job_agent.sources import SourceError
+        f = self.make([(404, 'нет')])
+        with mock.patch('time.sleep') as sleep, self.assertRaises(SourceError):
+            f.get('https://x')
+        self.assertEqual(sleep.call_count, 0)
+        f = self.make([(403, 'x')] * 3)
+        with mock.patch('time.sleep') as sleep, self.assertRaises(SourceError) as ctx:
+            f.get('https://x')
+        self.assertEqual(sleep.call_count, 2)  # паузы только между попытками
+        self.assertIn('HTTP 403', str(ctx.exception))
+
+
+class SafetyTest(unittest.TestCase):
+    def test_formula_variants_escaped(self):
+        from job_agent.storage import safe
+        for value in ['=1+1', ' =1+1', '\t=1', '\rx', '@SUM(A1)', '-2']:
+            self.assertTrue(safe(value).startswith("'"), value)
+        self.assertEqual(safe('Бухгалтер'), 'Бухгалтер')
+
+    def test_empty_env_value_uses_default(self):
+        import os
+        from unittest import mock
+
+        from job_agent.config import env
+        with mock.patch.dict(os.environ, {'DECISION_KEEP': ''}):
+            self.assertEqual(env('DECISION_KEEP', '0.8'), '0.8')
+
+    def test_sheet_with_old_header_is_rejected(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import GoogleSheet
+        ws = mock.MagicMock()
+        ws.row_values.return_value = ['Найдено', 'Ссылка']
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.return_value = ws
+        with mock.patch.dict(sys.modules, {'gspread': gspread}), self.assertRaises(RuntimeError):
+            GoogleSheet('id', 'creds.json')
+        ws.update.assert_not_called()  # старый лист не перезаписан
 
 
 class CriteriaTest(unittest.TestCase):

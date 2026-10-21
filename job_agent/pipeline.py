@@ -30,8 +30,10 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
             for v in fresh:
                 vd = verdicts[v.key]
                 decision = vd.decision(classifier.keep, classifier.drop)
-                if decision == 'review' and review == 'drop':
+                # Без ответа классификатора (сбой, отказ) вакансию не выбрасываем: завтра она уже вне 24 часов.
+                if decision == 'review' and review == 'drop' and not vd.error:
                     decision = 'drop'
+                known.add(v.url)  # решена — в другом городе/повторно в этот день не классифицируем
                 counts[decision] += 1
                 if verbose:
                     prob = f'{vd.probability:.2f}' if vd.probability is not None else ' -- '
@@ -41,7 +43,6 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
                     continue
                 # «Кратко» — начало описания с сайта; спорные помечены для ручной проверки.
                 rows.append(make_row(now, v, vd, v.snippet, 'классификатор' if decision == 'keep' else 'проверить'))
-                known.add(v.url)
             store.append(rows)
             errors = sum(1 for v in fresh if verdicts[v.key].error)
             total['found'] += len(found)

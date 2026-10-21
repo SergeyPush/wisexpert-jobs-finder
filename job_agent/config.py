@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+ROOT = Path(__file__).resolve().parent.parent  # корень проекта: .env и criteria.md ищутся здесь
 KYIV = ZoneInfo('Europe/Kyiv')
 SOURCES = ('work.ua', 'robota.ua')
 QUERY = 'бухгалтер'
@@ -26,7 +27,7 @@ CITIES = {
 }
 
 
-def load_dotenv(path: Path = Path('.env')) -> None:
+def load_dotenv(path: Path = ROOT / '.env') -> None:
     """Минимальный загрузчик .env, без лишней зависимости. Уже заданные переменные не перезаписывает."""
     if not path.exists():
         return
@@ -39,13 +40,14 @@ def load_dotenv(path: Path = Path('.env')) -> None:
 
 
 def env(name: str, default: str = '') -> str:
-    return os.environ.get(name, default).strip()
+    """Значение переменной; пустая строка (например, `KEY=` в .env) тоже даёт default."""
+    return os.environ.get(name, '').strip() or default
 
 
 def load_criteria(path: str = '') -> str:
     """Текст критериев отбора из criteria.md (или CRITERIA_FILE). HTML-комментарии вырезаются — это заметки для человека."""
     # По умолчанию — criteria.md в корне проекта, независимо от текущей папки.
-    file = Path(path or env('CRITERIA_FILE') or Path(__file__).resolve().parent.parent / 'criteria.md')
+    file = Path(path or env('CRITERIA_FILE') or ROOT / 'criteria.md')
     if not file.exists():
         raise SystemExit(f'Нет файла критериев {file}: создайте его, см. README')
     criteria = re.sub(r'<!--.*?-->', '', file.read_text(encoding='utf-8'), flags=re.S).strip()

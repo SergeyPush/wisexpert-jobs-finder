@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -65,8 +66,14 @@ class Fetcher:
                 err = f'HTTP {resp.status_code}' + (' (Cloudflare challenge)' if challenged else '')
                 if resp.status_code == 404:
                     break
-            time.sleep(5 * (attempt + 1))  # экспоненциальная-ish пауза перед повтором
+            if attempt + 1 < retries:
+                time.sleep(5 * (attempt + 1))  # растущая пауза только перед повтором
         raise SourceError(f'{url}: {err}')
+
+
+def skip_card(source: str, ident, exc: Exception) -> None:
+    """Одна карточка с неожиданной структурой не должна обрывать сбор — пропускаем её с предупреждением."""
+    print(f'{source}: пропущена карточка {ident}: {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
 def within(posted: datetime, now: datetime, hours: int = 24) -> bool:
@@ -93,7 +100,11 @@ def parse_work_listing(page: str, city: str) -> list[tuple[Vacancy, datetime | N
         if not link:
             continue
         when = re.search(r'<time[^>]*datetime="([^"]+)"', card)
-        posted = datetime.fromisoformat(when.group(1)).replace(tzinfo=KYIV) if when else None
+        try:
+            posted = datetime.fromisoformat(when.group(1)).replace(tzinfo=KYIV) if when else None
+        except ValueError as exc:
+            skip_card('work.ua', link.group(1), exc)
+            continue
         posted_str = posted.isoformat(timespec='minutes') if posted else ''
         if not posted:
             # «вакансія від 16 жовтня 2026» → только дата
@@ -160,15 +171,20 @@ def parse_robota_search(data: dict, city: str) -> list[tuple[Vacancy, datetime]]
         # Поиск может подмешивать вакансии других городов — оставляем только нужный.
         if v.get('cityId') != city_id:
             continue
-        # API отдаёт локальное киевское время без зоны, иногда с долями секунды.
-        posted = datetime.fromisoformat(v['date'][:19]).replace(tzinfo=KYIV)
-        result.append((Vacancy(
-            key=f'robota:{v["id"]}', source='robota.ua', city=city,
-            title=text(v.get('name', '')), company=text(v.get('companyName', '')),
-            salary=robota_salary(v), posted=posted.isoformat(timespec='minutes'),
-            url=f'https://robota.ua/company{v["notebookId"]}/vacancy{v["id"]}',
-            snippet=text(v.get('shortDescription', ''))[:300],
-        ), posted))
+        try:
+            # API отдаёт локальное киевское время без зоны, иногда с долями секунды.
+            posted = datetime.fromisoformat(v['date'][:19]).replace(tzinfo=KYIV)
+            vac = Vacancy(
+                key=f'robota:{v["id"]}', source='robota.ua', city=city,
+                title=text(v.get('name') or ''), company=text(v.get('companyName') or ''),
+                salary=robota_salary(v), posted=posted.isoformat(timespec='minutes'),
+                url=f'https://robota.ua/company{v["notebookId"]}/vacancy{v["id"]}',
+                snippet=text(v.get('shortDescription') or '')[:300],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            skip_card('robota.ua', v.get('id', '?'), exc)
+            continue
+        result.append((vac, posted))
     return result
 
 

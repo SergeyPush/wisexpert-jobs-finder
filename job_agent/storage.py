@@ -8,11 +8,6 @@ HEADER = ['Найдено', 'Опубликовано', 'Сайт', 'Город'
           'Кратко', 'Решил', 'Ссылка']
 
 
-def url_column(header: list[str]) -> int:
-    """Колонку ссылки ищем по заголовку: старые файлы могли иметь другой набор колонок."""
-    return header.index('Ссылка') if 'Ссылка' in header else len(header) - 1
-
-
 def make_row(now, vac, verdict, summary: str, decided_by: str) -> list[str]:
     """Строка CSV/таблицы. verdict — Verdict классификатора или None, если решал не он."""
     prob = f'{verdict.probability:.2f}' if verdict is not None and verdict.probability is not None else ''
@@ -21,8 +16,16 @@ def make_row(now, vac, verdict, summary: str, decided_by: str) -> list[str]:
 
 
 def safe(value: str) -> str:
-    """Текст с сайтов не должен исполняться как формула в таблице."""
-    return "'" + value if value[:1] in ('=', '+', '-', '@') else value
+    """Текст с сайтов не должен исполняться как формула в таблице (в т.ч. с ведущими пробелами/табами)."""
+    if value[:1] in ('\t', '\r') or value.lstrip()[:1] in ('=', '+', '-', '@'):
+        return "'" + value
+    return value
+
+
+def check_header(header: list[str], where: str) -> None:
+    """Дописывать строки под другой набор колонок нельзя — столбцы перепутаются, сломается дедупликация."""
+    if header and header != HEADER:
+        raise RuntimeError(f'{where}: старый набор колонок — переименуйте файл/лист, будет создан новый')
 
 
 class GoogleSheet:
@@ -34,13 +37,14 @@ class GoogleSheet:
             self.ws = book.worksheet(worksheet)
         except gspread.WorksheetNotFound:
             self.ws = book.add_worksheet(worksheet, rows=1000, cols=len(HEADER))
-        if self.ws.row_values(1) != HEADER:
+        header = self.ws.row_values(1)
+        check_header(header, f'лист «{worksheet}»')
+        if not header:
             self.ws.update([HEADER], 'A1')
             self.ws.freeze(rows=1)
 
     def known_urls(self) -> set[str]:
-        header = self.ws.row_values(1)
-        return set(self.ws.col_values(url_column(header) + 1)[1:])
+        return set(self.ws.col_values(HEADER.index('Ссылка') + 1)[1:])
 
     def append(self, rows: list[list[str]]) -> None:
         if rows:
@@ -53,22 +57,25 @@ class CsvStore:
         self.path = Path(path)
 
     def known_urls(self) -> set[str]:
+        """Ссылки уже сохранённых вакансий. Вызывается в начале запуска — заодно проверяет заголовок,
+        чтобы несовместимый файл обнаружился до запросов к API."""
         if not self.path.exists():
             return set()
         with self.path.open(encoding='utf-8-sig', newline='') as f:
             rows = list(csv.reader(f))
         if not rows:
             return set()
-        col = url_column(rows[0])
+        check_header(rows[0], str(self.path))
+        col = HEADER.index('Ссылка')
         return {row[col] for row in rows[1:] if len(row) > col}
 
     def append(self, rows: list[list[str]]) -> None:
-        new = not self.path.exists()
+        if not rows:
+            return
+        new = not self.path.exists() or self.path.stat().st_size == 0
         if not new:
             with self.path.open(encoding='utf-8-sig', newline='') as f:
-                header = next(csv.reader(f), [])
-            if header and header != HEADER:
-                raise RuntimeError(f'{self.path}: старый набор колонок — переименуйте файл, будет создан новый')
+                check_header(next(csv.reader(f), []), str(self.path))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open('a', encoding='utf-8-sig' if new else 'utf-8', newline='') as f:
             w = csv.writer(f)
