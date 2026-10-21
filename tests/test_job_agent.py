@@ -144,15 +144,42 @@ class ClassifierTest(unittest.TestCase):
 
         from job_agent.classifier import ClassifierError, DecisionsClassifier
         vacs = self.vacs * 20
+        no_credits = openai.RateLimitError('You have no credits remaining', response=mock.Mock(status_code=429),
+                                           body={'code': 'insufficient_quota'})
         with mock.patch('openai.OpenAI') as cls:
             create = cls.return_value.decisions.create
-            create.side_effect = openai.APIConnectionError(request=mock.Mock())  # request в тесте не нужен
+            create.side_effect = no_credits
             c = DecisionsClassifier('критерии')
             with self.assertRaises(ClassifierError):
                 c.classify_many(vacs)
-        # Нет кредитов / API недоступен — один запрос, а не по запросу на каждую вакансию.
+        # Нет кредитов — один запрос без повторов, а не по запросу на каждую вакансию.
         self.assertEqual(create.call_count, 1)
         cls.assert_called_once_with(max_retries=0)
+
+    def test_transient_error_retried(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+
+        import openai
+
+        from job_agent import classifier
+        from job_agent.classifier import ClassifierError, DecisionsClassifier
+        unavailable = openai.InternalServerError('Decision inference is unavailable.',
+                                                 response=mock.Mock(status_code=503), body=None)
+        ok = NS(answers=[NS(name='matches', type='predicate', probability=0.9)])
+        with mock.patch('openai.OpenAI') as cls, mock.patch.object(classifier.time, 'sleep') as sleep:
+            create = cls.return_value.decisions.create
+            c = DecisionsClassifier('критерии')
+            # 503 дважды, затем ответ — вакансия классифицирована.
+            create.side_effect = [unavailable, unavailable, ok]
+            self.assertEqual(c.classify(self.vacs[0]).probability, 0.9)
+            self.assertEqual(sleep.call_count, 2)
+            # 503 больше RETRIES раз — остановка.
+            create.side_effect = unavailable
+            create.reset_mock()
+            with self.assertRaises(ClassifierError):
+                c.classify(self.vacs[0])
+            self.assertEqual(create.call_count, classifier.RETRIES + 1)
 
     def test_refusal_goes_to_review(self):
         from job_agent.classifier import Verdict

@@ -1,10 +1,15 @@
 """Предварительный отбор вакансий через OpenAI Decisions API: вероятность «подходит под criteria.md» и уровень."""
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .sources import Vacancy
+
+# Повторы при временных сбоях API (503, обрыв связи, лимит запросов в минуту).
+RETRIES = 2
+RETRY_DELAY = 5.0  # секунд, растёт с каждой попыткой
 
 LEVEL_QUESTION = {
     'type': 'choice',
@@ -63,16 +68,30 @@ class DecisionsClassifier:
         import openai  # импорт тут: классификатор необязателен
 
         self.openai = openai
-        self.client = openai.OpenAI(max_retries=0)  # один запрос без повторов: при сбое API сразу остановка
+        # Повторы SDK выключены: он повторяет и 429 «нет кредитов». Временные сбои повторяем сами — см. transient().
+        self.client = openai.OpenAI(max_retries=0)
         self.questions = build_questions(criteria)
         self.model, self.keep, self.drop, self.workers = model, keep, drop, workers
 
+    def transient(self, exc: Exception) -> bool:
+        """Временный сбой (5xx, сеть, таймаут, лимит запросов в минуту) — есть смысл повторить.
+        Нет кредитов, неверный ключ/модель, ошибка запроса — повтор не поможет."""
+        if isinstance(exc, self.openai.RateLimitError):
+            text = f'{getattr(exc, "code", "")} {exc}'.lower()
+            return not any(w in text for w in ('insufficient_quota', 'quota', 'credits'))
+        return isinstance(exc, (self.openai.InternalServerError, self.openai.APIConnectionError))
+
     def classify(self, v: Vacancy) -> Verdict:
-        try:
-            resp = self.client.decisions.create(model=self.model, input=card_text(v), questions=self.questions)
-        except self.openai.APIError as exc:
-            # Любой сбой API (нет кредитов, лимит, ключ, модель) — остановка всей работы, а не ошибка на каждую вакансию.
-            raise ClassifierError(f'{type(exc).__name__}: {exc}'[:300]) from exc
+        for attempt in range(RETRIES + 1):
+            try:
+                resp = self.client.decisions.create(model=self.model, input=card_text(v), questions=self.questions)
+                break
+            except self.openai.APIError as exc:
+                if attempt < RETRIES and self.transient(exc):
+                    time.sleep(RETRY_DELAY * (attempt + 1))  # растущая пауза: 5, 10 секунд
+                    continue
+                # Сбой не временный или повторы кончились — остановка всей работы, а не ошибка на каждую вакансию.
+                raise ClassifierError(f'{type(exc).__name__}: {exc}'[:300]) from exc
         answers = {a.name: a for a in resp.answers}
         pred, level = answers.get('matches'), answers.get('level')
         if pred is None or pred.type == 'refusal':
