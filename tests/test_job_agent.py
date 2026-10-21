@@ -312,6 +312,76 @@ class SafetyTest(unittest.TestCase):
         ws.update.assert_not_called()  # старый лист не перезаписан
 
 
+class MonitoringTest(unittest.TestCase):
+    def test_suspicious_zeros(self):
+        from job_agent.pipeline import suspicious_zeros
+        cities = ['Одесса', 'Ужгород', 'Киев', 'Львов']
+        found = {('work.ua', c): 0 for c in cities} | {('robota.ua', 'Ужгород'): 0, ('robota.ua', 'Львов'): 5}
+        warnings = suspicious_zeros(found, ['work.ua', 'robota.ua'], cities)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('work.ua: 0 вакансий во всех городах', warnings[0])
+        # Ноль в Киеве подозрителен сам по себе; ноль в одном маленьком городе — нет.
+        self.assertIn('Киев', suspicious_zeros({('robota.ua', 'Киев'): 0}, ['robota.ua'], ['Киев'])[0])
+        self.assertEqual(suspicious_zeros({('robota.ua', 'Ужгород'): 0}, ['robota.ua'], ['Ужгород']), [])
+
+    def test_source_error_goes_to_problems(self):
+        import contextlib
+        import io
+
+        import job_agent.pipeline as pipeline
+        from job_agent.sources import SourceError
+
+        def blocked(*a):
+            raise SourceError('https://www.work.ua/...: HTTP 403 (Cloudflare challenge)')
+
+        original = pipeline.search
+        pipeline.search = blocked
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _, total = pipeline.run_classifier(FakeStore(), ['Киев'], ['work.ua'], NOW, FakeClassifier({}), fetcher=None)
+        finally:
+            pipeline.search = original
+        self.assertEqual(total['errors'], 1)
+        self.assertIn('HTTP 403', total['problems'][0])
+
+    def test_notify_modes_and_payload(self):
+        import os
+        from unittest import mock
+
+        import job_agent.notify as notify
+        cfg = {'TELEGRAM_BOT_TOKEN': 'T', 'TELEGRAM_CHAT_ID': '42', 'TELEGRAM_NOTIFY': 'problems'}
+        with mock.patch.dict(os.environ, cfg), mock.patch.object(notify.requests, 'post') as post:
+            post.return_value.status_code = 200
+            notify.notify([], 'сводка')  # проблем нет — молчим
+            post.assert_not_called()
+            notify.notify(['work.ua · Киев: ОШИБКА HTTP 403'], 'сводка')
+            url, kwargs = post.call_args.args[0], post.call_args.kwargs
+        self.assertEqual(url, 'https://api.telegram.org/botT/sendMessage')
+        self.assertEqual(kwargs['json']['chat_id'], '42')
+        self.assertIn('HTTP 403', kwargs['json']['text'])
+        with mock.patch.dict(os.environ, cfg | {'TELEGRAM_NOTIFY': 'always'}), \
+                mock.patch.object(notify.requests, 'post') as post:
+            post.return_value.status_code = 200
+            notify.notify([], 'x' * 5000)
+            self.assertLessEqual(len(post.call_args.kwargs['json']['text']), notify.LIMIT + 2)
+
+    def test_telegram_failure_does_not_raise(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        import job_agent.notify as notify
+        cfg = {'TELEGRAM_BOT_TOKEN': 'SECRET', 'TELEGRAM_CHAT_ID': '42'}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, cfg), contextlib.redirect_stderr(err), \
+                mock.patch.object(notify.requests, 'post', side_effect=notify.requests.RequestsError('bot SECRET')):
+            self.assertFalse(notify.send_telegram('текст'))
+        self.assertNotIn('SECRET', err.getvalue())  # токен не утекает в лог
+        with mock.patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': '', 'TELEGRAM_CHAT_ID': ''}):
+            self.assertFalse(notify.send_telegram('текст'))
+
+
 class CriteriaTest(unittest.TestCase):
     def test_comments_stripped(self):
         from job_agent.config import load_criteria

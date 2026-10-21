@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import CITIES, KYIV, SOURCES, env, load_criteria, load_dotenv
 from .sources import Fetcher, SourceError, search
+from .notify import notify, send_telegram, telegram_configured
 from .storage import CsvStore, GoogleSheet, write_snapshot
 
 MARKS = {'keep': '✔', 'drop': '✘', 'review': '?'}
@@ -75,16 +76,34 @@ def main() -> int:
     parser.add_argument('--check', action='store_true', help='Только проверить сбор, без сохранения')
     parser.add_argument('--classify', action='store_true', help='С --check: показать решения классификатора')
     parser.add_argument('--save', metavar='CSV', help='С --check: сохранить все найденные вакансии (и решения) в CSV')
+    parser.add_argument('--test-telegram', action='store_true', help='Отправить тестовое сообщение в Telegram')
     parser.add_argument('-v', '--verbose', action='store_true', help='Печатать решение по каждой вакансии')
     args = parser.parse_args()
     now = datetime.now(KYIV)
 
+    if args.test_telegram:
+        if not telegram_configured():
+            parser.error('задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env')
+        ok = send_telegram('✅ Поиск вакансий: уведомления настроены')
+        print('Отправлено' if ok else 'Не отправлено — см. ошибку выше')
+        return 0 if ok else 1
     if args.save and not args.check:
         parser.error('--save работает только с --check; результаты поиска пишутся в --output')
     if args.check:
         return check_sources(args, now)
 
+    code, problems, summary = search_and_save(args, now, parser)
+    notify(problems, summary)
+    return code
+
+
+def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
+    """Основной запуск. Возвращает (код выхода, проблемы для уведомления, итоговая строка)."""
     from .pipeline import REVIEW_ACTIONS, run_classifier  # импорт тут: --check не требует openai
+
+    def fail(message: str) -> tuple[int, list[str], str]:
+        print(message, file=sys.stderr)
+        return 1, [message], ''
 
     review = env('REVIEW_ACTION', 'save').lower()
     if review not in REVIEW_ACTIONS:
@@ -96,30 +115,31 @@ def main() -> int:
         try:
             store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии')), 'Google Sheets'
         except Exception as exc:  # нет доступа, неверный ID, несовместимые колонки
-            print(f'Google Sheets ({type(exc).__name__}): {exc}', file=sys.stderr)
-            return 1
+            return fail(f'Google Sheets ({type(exc).__name__}): {exc}')
     else:
         store, target = CsvStore(args.output), str(Path(args.output).resolve())
 
-    classifier = make_classifier()
+    try:
+        classifier = make_classifier()
+    except SystemExit as exc:  # нет ключа — об этом тоже нужно узнать из уведомления
+        return fail(str(exc))
     print(f'Классификатор: {classifier.model}, пороги {classifier.keep}/{classifier.drop}, '
           f'спорные: {"сохранять с пометкой «проверить»" if review == "save" else "отбрасывать"}. '
           f'Результаты: {target}', flush=True)
     try:
         store.known_urls()  # несовместимый CSV/лист — ошибка до первых запросов к сайтам и API
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return fail(str(exc))
     try:
         _, total = run_classifier(store, args.cities, args.sources, now, classifier,
                                   fetcher=Fetcher(delay=args.delay, proxy=env('PROXY_URL')),
                                   max_pages=args.max_pages, review=review, verbose=args.verbose)
     except Exception as exc:  # неверный ключ, нет доступа к модели и т.п.
-        print(f'Ошибка классификатора ({type(exc).__name__}): {exc}', file=sys.stderr)
-        return 1
-    print(f"[{now:%Y-%m-%d %H:%M}] Подходит: {total['saved']}, проверить: {total['review']}, "
-          f"отброшено: {total['dropped']} из {total['found']} → {target}")
-    return 1 if total['errors'] else 0
+        return fail(f'Ошибка классификатора ({type(exc).__name__}): {exc}')
+    summary = (f"[{now:%Y-%m-%d %H:%M}] Подходит: {total['saved']}, проверить: {total['review']}, "
+               f"отброшено: {total['dropped']} из {total['found']} → {target}")
+    print(summary)
+    return (1 if total['errors'] else 0), total['problems'], summary
 
 
 if __name__ == '__main__':
