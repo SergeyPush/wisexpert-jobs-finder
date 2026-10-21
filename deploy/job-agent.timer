@@ -1,0 +1,11 @@
+[Unit]
+Description=Ежедневный поиск вакансий бухгалтера
+
+[Timer]
+# 09:00 по Киеву, независимо от часового пояса сервера
+OnCalendar=*-*-* 09:00:00 Europe/Kyiv
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

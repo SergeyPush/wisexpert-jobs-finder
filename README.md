@@ -1,0 +1,97 @@
+# Поиск вакансий бухгалтера
+
+Ищет вакансии бухгалтера за последние 24 часа на **work.ua** и **robota.ua** в городах **Одесса, Ужгород, Киев, Львов**, оценивает каждую по критериям из `criteria.md` через **OpenAI Decisions API** и дописывает подходящие в **CSV** (`jobs.csv`). Google Sheets — по флагу `--sheets`.
+
+## Как работает
+
+```
+uv run main.py
+  └─ для каждого сайта и города:
+       сбор за 24ч ── work.ua HTML / api.robota.ua JSON (curl_cffi, без браузера)
+       └─ уже сохранённые ссылки пропускаются
+       └─ Decisions API (gpt-6-luna): вероятность «подходит под criteria.md» + уровень
+            ≥ DECISION_KEEP (0.8) → в CSV, Решил = классификатор
+            ≤ DECISION_DROP (0.2) → отброшена
+            между                 → REVIEW_ACTION=save: в CSV, Решил = проверить (по умолчанию)
+                                    REVIEW_ACTION=drop: отброшена
+```
+
+- Сбор идёт обычными HTTP-запросами через `curl_cffi` с TLS-отпечатком Chrome (иначе Cloudflare на work.ua отвечает 403).
+- Окно 24 часа отсекается по точному времени публикации. Платные «гарячі» карточки work.ua без времени берутся, только если размещены сегодня.
+- Решение принимается по краткой карточке: название, компания, зарплата, начало описания. Полное описание не открывается.
+- Один запрос к Decisions API на вакансию, параллельно в 8 потоков.
+
+Колонки CSV/таблицы: Найдено · Опубликовано · Сайт · Город · Должность · Компания · Зарплата · Уровень · Вероятность · Кратко · Решил · Ссылка. «Кратко» — начало описания с сайта.
+
+## Критерии отбора — `criteria.md`
+
+Какие вакансии нужны, описано обычным текстом в `criteria.md` в корне проекта. Вакансия подходит, если выполнены все пункты. Добавить критерий — дописать строку, например «Не подходят вакансии только в офисе. Удалённая и гибридная работа подходят.». Комментарии `<!-- -->` модель не видит.
+
+Поисковый запрос на сайтах (`бухгалтер`) задан отдельно — `QUERY` в `job_agent/config.py`: `criteria.md` отбирает только среди найденного.
+
+Проверить критерии и пороги без записи в CSV:
+```sh
+uv run main.py --check --classify --cities Ужгород   # ✔ подходит / ✘ отброшена / ? проверить, с вероятностями
+```
+Сравнить «до и после классификатора» — сохранить снимок проверки в CSV (`--save`, файл перезаписывается):
+```sh
+uv run main.py --check --save before.csv              # все найденные вакансии, без отбора
+uv run main.py --check --classify --save after.csv    # те же + Вероятность, Уровень, Решение (подходит / проверить / отброшена)
+```
+В `after.csv` есть все вакансии, включая отброшенные: фильтр по колонке «Решение» показывает, что отсекает классификатор. `--check` не учитывает `jobs.csv`, поэтому в снимок попадают и уже сохранённые раньше вакансии.
+
+Decisions API в публичной бете; пороги подбирайте по колонкам «Вероятность» и «Решил» в `jobs.csv`.
+
+## Настройка
+
+1. `cp .env.example .env` и указать `OPENAI_API_KEY` (https://platform.openai.com/api-keys). Остальное — пороги, `REVIEW_ACTION`, файл критериев — по желанию.
+2. **Google Sheets** (необязательно, для `--sheets`):
+   - Google Cloud Console → создать проект → включить *Google Sheets API*.
+   - IAM → Service Accounts → создать → Keys → Add key → JSON. Сохранить как `service-account.json` в папке проекта.
+   - Создать таблицу и дать доступ «Редактор» на email сервисного аккаунта (`...@...iam.gserviceaccount.com`).
+   - ID таблицы взять из URL: `docs.google.com/spreadsheets/d/<ID>/edit` → `GOOGLE_SHEET_ID`.
+
+## Запуск
+
+Нужен [uv](https://docs.astral.sh/uv/) (`brew install uv`). Зависимости — в `pyproject.toml`, точные версии — в `uv.lock`. Добавить пакет: `uv add <пакет>`, обновить: `uv lock --upgrade`.
+
+```sh
+uv sync                                  # создаёт .venv по uv.lock (Python 3.13 скачается сам)
+uv run main.py --check                   # проверить сбор (без OpenAI, бесплатно)
+uv run main.py -v                        # поиск → jobs.csv, с решением по каждой вакансии
+uv run main.py --cities Киев Львов       # только эти города
+uv run main.py --output out/today.csv    # другой файл
+uv run main.py --sheets                  # → Google Sheets
+uv run python -m unittest discover -s tests
+```
+
+CSV в UTF-8 с BOM — открывается в Excel. Каждый запуск дописывает строки; уже записанные ссылки пропускаются. Опции: `--sources work.ua`, `--max-pages 30`, `--delay 1.5`.
+
+## Деплой на VPS (Ubuntu/Debian)
+
+```sh
+sudo useradd -r -m -d /opt/job-search-agent jobagent
+sudo -u jobagent git clone <repo> /opt/job-search-agent   # или scp папки проекта
+cd /opt/job-search-agent
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh   # uv один раз на сервер
+sudo -u jobagent uv sync --frozen   # ровно версии из uv.lock
+# положить .env (и service-account.json для --sheets), chmod 600
+sudo -u jobagent uv run main.py --check   # убедиться, что сайты не блокируют IP сервера
+
+sudo cp deploy/job-agent.service deploy/job-agent.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now job-agent.timer
+sudo systemctl start job-agent.service   # ручной запуск
+journalctl -u job-agent -n 50            # лог запуска
+```
+
+Обновление: `git pull && sudo -u jobagent uv sync --frozen`. systemd запускает `.venv/bin/python` напрямую, без сети и без uv во время запуска.
+
+Таймер срабатывает в 09:00 по Киеву независимо от часового пояса сервера; `Persistent=true` догоняет пропущенный запуск после перезагрузки.
+
+## Важно
+
+- **Блокировки.** work.ua и robota.ua стоят за Cloudflare. С домашнего IP всё работает, но IP дата-центров блокируются чаще. Если `--check` на VPS показывает `Cloudflare challenge`, задайте `PROXY_URL` (лучше украинский резидентный прокси).
+- **robota.ua** опрашивается через публичный JSON API `api.robota.ua` (тот же, что использует сайт). Он недокументирован и может измениться.
+- **Дата** — по данным сайта; при «поднятии» вакансии она обновляется, поэтому старая вакансия может снова попасть в 24 часа. Повторно в таблицу она не запишется: дубли отсекаются по ссылке.
+- **Стоимость.** ~300–400 карточек в день по ~150 токенов — около 60 тыс. входных токенов; при $0.10 за 1M это меньше цента в день. Выходные токены Decisions API бесплатны.
+- **Ошибки классификатора.** Если по вакансии Decisions API не ответил (сбой или отказ), она считается спорной. Неверный ключ или недоступная модель останавливают запуск.

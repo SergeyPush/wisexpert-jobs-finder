@@ -1,0 +1,15 @@
+[project]
+name = "job-search-agent"
+version = "0.1.0"
+description = "Поиск вакансий бухгалтера за 24 часа на work.ua и robota.ua с отбором через OpenAI Decisions API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "curl_cffi>=0.16,<1",
+    "gspread>=6.2,<7",
+    "openai>=1.60,<4",
+]
+
+[tool.uv]
+# Приложение, а не библиотека: ставим только зависимости, сам проект не собираем.
+package = false

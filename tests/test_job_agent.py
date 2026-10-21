@@ -1,0 +1,190 @@
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+from job_agent.config import KYIV
+from job_agent.sources import parse_robota_search, parse_work_listing, within
+from job_agent.storage import CsvStore
+
+NOW = datetime(2026, 10, 20, 22, 0, tzinfo=KYIV)
+
+# Фрагмент реальной разметки выдачи work.ua (сокращён).
+WORK_HTML = '''
+<div tabindex="0" class="card card-hover card-visited wordwrap job-link mt-sm sm:mt-lg">
+ <h2 class="my-0"><a tabindex="-1" href="/jobs/8613931/" title="x">Головний бухгалтер</a></h2>
+ <div class="text-indent"><span class="glyphicon glyphicon-hryvnia-fill" title="Зарплата"></span>
+  <span class="strong-600">50&#8239;000&nbsp;грн</span></div>
+ <div class="text-indent"><span class="glyphicon glyphicon-company" title="Дані про компанію"></span>
+  <span class=""><span class="strong-600">Теплі спогади</span></span></div>
+ <span class="glyphicon glyphicon-map-marker" title="Адреса роботи"></span><span class="">Одеса, </span>
+ <p class="ellipsis ellipsis-line">Досвід від 5 років, 1С 8.3</p>
+ <time datetime="2026-10-20 17:19:09">5 год. тому</time>
+</div>
+<div tabindex="0" class="card card-hover card-visited wordwrap job-link mt-sm">
+ <h2 class="my-0"><a href="/jobs/111/">Бухгалтер</a></h2>
+ <time datetime="2026-10-18 10:00:00">2 дні тому</time>
+</div>
+<div tabindex="0" class="card card-hover card-visited wordwrap job-link js-hot-block">
+ <h2 class="my-0"><a href="/jobs/222/" title="Бухгалтер, вакансія від 16 жовтня 2026">Бухгалтер</a></h2>
+</div>
+'''
+
+
+class FakeStore:
+    def __init__(self, known=()):
+        self.rows, self.known = [], set(known)
+
+    def known_urls(self):
+        return set(self.known)
+
+    def append(self, rows):
+        self.rows += rows
+
+
+class ParsingTest(unittest.TestCase):
+    def test_work_listing(self):
+        cards = parse_work_listing(WORK_HTML, 'Одесса')
+        self.assertEqual(len(cards), 3)
+        self.assertEqual((cards[2][1], cards[2][0].posted), (None, '2026-10-16'))
+        vac, posted = cards[0]
+        self.assertEqual((vac.key, vac.title, vac.company, vac.salary), ('work:8613931', 'Головний бухгалтер', 'Теплі спогади', '50 000 грн'))
+        self.assertEqual(vac.url, 'https://www.work.ua/jobs/8613931/')
+        self.assertTrue(within(posted, NOW))
+        self.assertFalse(within(cards[1][1], NOW))
+
+    def test_robota_filters_other_cities(self):
+        data = {'documents': [
+            {'id': 1, 'notebookId': 9, 'name': 'Бухгалтер', 'companyName': 'А', 'cityId': 1, 'date': '2026-10-20T15:01:00.93',
+             'salaryFrom': 20000, 'salaryTo': 30000, 'shortDescription': 'текст'},
+            {'id': 2, 'notebookId': 9, 'name': 'Бухгалтер', 'companyName': 'Б', 'cityId': 3, 'date': '2026-10-20T15:01:00'},
+        ]}
+        cards = parse_robota_search(data, 'Киев')
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0][0].url, 'https://robota.ua/company9/vacancy1')
+        self.assertEqual(cards[0][0].salary, '20000–30000 грн')
+
+
+class StorageTest(unittest.TestCase):
+    def test_csv_store_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = CsvStore(str(Path(d) / 'jobs.csv'))
+            store.append([['a', 'b', 'c', 'd', '=HYPERLINK()', 'f', 'g', '', '', 'h', 'классификатор', 'https://x/1']])
+            self.assertEqual(store.known_urls(), {'https://x/1'})
+            self.assertIn("'=HYPERLINK()", (Path(d) / 'jobs.csv').read_text(encoding='utf-8-sig'))
+
+    def test_csv_old_header_is_not_mixed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'jobs.csv'
+            path.write_text('Найдено,Ссылка\nx,https://x/1\n', encoding='utf-8-sig')
+            store = CsvStore(str(path))
+            self.assertEqual(store.known_urls(), {'https://x/1'})
+            with self.assertRaises(RuntimeError):
+                store.append([['row']])
+
+
+class FakeClassifier:
+    keep, drop = 0.8, 0.2
+
+    def __init__(self, probs):
+        self.probs = probs
+
+    def classify_many(self, vacancies):
+        from job_agent.classifier import Verdict
+        return {v.key: Verdict(self.probs[v.key], 'бухгалтер') for v in vacancies}
+
+
+class ClassifierTest(unittest.TestCase):
+    def setUp(self):
+        from job_agent.sources import Vacancy
+        self.vacs = [Vacancy('work:1', 'work.ua', 'Киев', 'Бухгалтер', 'Ко', '', '2026-10-20T10:00+03:00',
+                             'https://www.work.ua/jobs/1/', 'описание 1')]
+
+    def test_decisions_response_parsing(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+
+        from job_agent.classifier import DecisionsClassifier
+        resp = NS(answers=[NS(name='matches', type='predicate', probability=0.91),
+                           NS(name='level', type='choice', choice='chief')])
+        with mock.patch('openai.OpenAI') as cls:
+            cls.return_value.decisions.create.return_value = resp
+            c = DecisionsClassifier('Только удалённая работа.')
+            v = c.classify(self.vacs[0])
+            kwargs = cls.return_value.decisions.create.call_args.kwargs
+        self.assertEqual((v.probability, v.level, v.decision(0.8, 0.2)), (0.91, 'главбух/зам', 'keep'))
+        self.assertEqual(kwargs['model'], 'gpt-6-luna')
+        self.assertIn('Должность: Бухгалтер', kwargs['input'])
+        # Критерии из criteria.md попадают в главный вопрос.
+        self.assertEqual(kwargs['questions'][0]['name'], 'matches')
+        self.assertIn('Только удалённая работа.', kwargs['questions'][0]['instructions'])
+
+    def test_refusal_goes_to_review(self):
+        from job_agent.classifier import Verdict
+        self.assertEqual(Verdict(None, error='отказ').decision(0.8, 0.2), 'review')
+
+
+class PipelineTest(unittest.TestCase):
+    def run_pipeline(self, review):
+        import job_agent.pipeline as pipeline
+        from job_agent.sources import Vacancy
+        mk = lambda i, t: Vacancy(f'work:{i}', 'work.ua', 'Киев', t, 'Ко', '', '2026-10-20T10:00+03:00',
+                                  f'https://www.work.ua/jobs/{i}/', f'описание {i}')
+        vacs = [mk(1, 'Бухгалтер'), mk(2, 'Касир'), mk(3, 'Спеціаліст з обліку'), mk(4, 'Головбух')]
+        store = FakeStore(known={'https://www.work.ua/jobs/4/'})  # уже сохранена раньше
+        clf = FakeClassifier({'work:1': 0.9, 'work:2': 0.1, 'work:3': 0.5})
+        original = pipeline.search
+        pipeline.search = lambda *a: vacs
+        try:
+            report, total = pipeline.run_classifier(store, ['Киев'], ['work.ua'], NOW, clf, fetcher=None, review=review)
+        finally:
+            pipeline.search = original
+        return store, report, total
+
+    def test_review_saved_with_mark(self):
+        store, report, total = self.run_pipeline('save')
+        self.assertEqual([(r[-2], r[-1]) for r in store.rows],
+                         [('классификатор', 'https://www.work.ua/jobs/1/'), ('проверить', 'https://www.work.ua/jobs/3/')])
+        self.assertEqual((total['found'], total['saved'], total['review'], total['dropped']), (4, 1, 1, 1))
+        self.assertIn('новых 3', report[0])
+
+    def test_review_dropped(self):
+        store, _, total = self.run_pipeline('drop')
+        self.assertEqual(len(store.rows), 1)
+        self.assertEqual((total['review'], total['dropped']), (0, 2))
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_snapshot_with_and_without_verdicts(self):
+        import csv
+
+        from job_agent.classifier import Verdict
+        from job_agent.storage import write_snapshot
+        vac = parse_work_listing(WORK_HTML, 'Одесса')[0][0]
+        with tempfile.TemporaryDirectory() as d:
+            raw, scored = Path(d) / 'before.csv', Path(d) / 'after.csv'
+            write_snapshot(str(raw), [(vac, None, '')], with_verdicts=False)
+            write_snapshot(str(scored), [(vac, Verdict(0.93, 'главбух/зам'), 'подходит')], with_verdicts=True)
+            raw_rows = list(csv.reader(raw.open(encoding='utf-8-sig')))
+            scored_rows = list(csv.reader(scored.open(encoding='utf-8-sig')))
+        self.assertEqual(raw_rows[0][-1], 'Ссылка')
+        self.assertEqual(raw_rows[1][-1], vac.url)
+        self.assertEqual(scored_rows[0][-4:], ['Вероятность', 'Уровень', 'Решение', 'Ошибка'])
+        self.assertEqual(scored_rows[1][-4:], ['0.93', 'главбух/зам', 'подходит', ''])
+
+
+class CriteriaTest(unittest.TestCase):
+    def test_comments_stripped(self):
+        from job_agent.config import load_criteria
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'criteria.md'
+            path.write_text('<!-- заметка -->\nТолько удалёнка.', encoding='utf-8')
+            self.assertEqual(load_criteria(str(path)), 'Только удалёнка.')
+
+    def test_project_criteria_file_loads(self):
+        from job_agent.config import load_criteria
+        self.assertIn('бухгалтер', load_criteria(str(Path(__file__).parent.parent / 'criteria.md')))
+
+
+if __name__ == '__main__':
+    unittest.main()

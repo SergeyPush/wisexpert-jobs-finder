@@ -1,0 +1,10 @@
+[Unit]
+Description=Поиск вакансий бухгалтера
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jobagent
+WorkingDirectory=/opt/job-search-agent
+ExecStart=/opt/job-search-agent/.venv/bin/python -m job_agent
