@@ -53,6 +53,22 @@ class ParsingTest(unittest.TestCase):
         self.assertTrue(within(posted, NOW))
         self.assertFalse(within(cards[1][1], NOW))
 
+    def test_work_salary_not_specified(self):
+        # Реальная разметка work.ua: зарплата не указана — текст без strong-600, компания не должна попасть в зарплату.
+        card = '''
+<div tabindex="0" class="card card-hover card-visited wordwrap job-link mt-sm sm:mt-lg">
+ <h2 class="my-0"><a tabindex="-1" href="/jobs/5378424/" title="x">Бухгалтер з первинної документації</a></h2>
+ <div class="text-indent">
+  <span class="glyphicon glyphicon-hryvnia-fill glyphicon-fs-24 text-default-7" title="Зарплата"></span>
+      <span class="text-default-7">ЗП обговорюється під час співбесіди</span>
+ </div>
+ <div class="text-indent"><span class="glyphicon glyphicon-company glyphicon-fs-24 text-default-7" title="Дані про компанію"></span>
+  <span class="mr-xs"><span class="strong-600">Supramarine, LLC</span></span></div>
+ <time datetime="2026-10-20 18:44:01"></time>
+</div>'''
+        vac = parse_work_listing(card, 'Одесса')[0][0]
+        self.assertEqual((vac.company, vac.salary), ('Supramarine, LLC', 'ЗП обговорюється під час співбесіди'))
+
     def test_robota_filters_other_cities(self):
         data = {'documents': [
             {'id': 1, 'notebookId': 9, 'name': 'Бухгалтер', 'companyName': 'А', 'cityId': 1, 'date': '2026-10-20T15:01:00.93',

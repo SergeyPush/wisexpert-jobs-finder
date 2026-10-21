@@ -111,7 +111,9 @@ def parse_work_listing(page: str, city: str) -> list[tuple[Vacancy, datetime | N
             d = re.search(r'від (\d{1,2}) (\w+) (\d{4})', link.group(2))
             if d and d.group(2) in UA_MONTHS:
                 posted_str = f'{d.group(3)}-{UA_MONTHS[d.group(2)]:02d}-{int(d.group(1)):02d}'
-        salary = re.search(r'glyphicon-hryvnia.*?<span class="strong-600">(.*?)</span>', card, re.S)
+        # Только span сразу за иконкой: без суммы там «ЗП обговорюється…» без strong-600,
+        # и поиск дальше по карточке захватывал бы название компании.
+        salary = re.search(r'glyphicon-hryvnia[^>]*></span>\s*<span[^>]*>(.*?)</span>', card, re.S)
         company = re.search(r'glyphicon-company.*?<span class="strong-600">(.*?)</span>', card, re.S)
         address = re.search(r'title="Адреса роботи"></span><span[^>]*>(.*?)</span>', card, re.S)
         snippet = re.search(r'<p class="ellipsis[^"]*"[^>]*>(.*?)(?:</p>|<div)', card, re.S)
