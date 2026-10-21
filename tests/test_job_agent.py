@@ -121,6 +121,23 @@ class ClassifierTest(unittest.TestCase):
         self.assertEqual(kwargs['questions'][0]['name'], 'matches')
         self.assertIn('Только удалённая работа.', kwargs['questions'][0]['instructions'])
 
+    def test_api_error_stops_after_one_call(self):
+        from unittest import mock
+
+        import openai
+
+        from job_agent.classifier import ClassifierError, DecisionsClassifier
+        vacs = self.vacs * 20
+        with mock.patch('openai.OpenAI') as cls:
+            create = cls.return_value.decisions.create
+            create.side_effect = openai.APIConnectionError(request=mock.Mock())  # request в тесте не нужен
+            c = DecisionsClassifier('критерии')
+            with self.assertRaises(ClassifierError):
+                c.classify_many(vacs)
+        # Нет кредитов / API недоступен — один запрос, а не по запросу на каждую вакансию.
+        self.assertEqual(create.call_count, 1)
+        cls.assert_called_once_with(max_retries=0)
+
     def test_refusal_goes_to_review(self):
         from job_agent.classifier import Verdict
         self.assertEqual(Verdict(None, error='отказ').decision(0.8, 0.2), 'review')

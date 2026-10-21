@@ -32,6 +32,10 @@ def build_questions(criteria: str) -> list[dict]:
 LEVELS = {'chief': 'главбух/зам', 'accountant': 'бухгалтер', 'assistant': 'помощник', 'not_accounting': 'не бухгалтер'}
 
 
+class ClassifierError(RuntimeError):
+    """API классификатора не ответил — работу нужно остановить."""
+
+
 @dataclass
 class Verdict:
     probability: float | None  # None — классификатор не ответил (ошибка или отказ)
@@ -59,17 +63,16 @@ class DecisionsClassifier:
         import openai  # импорт тут: классификатор необязателен
 
         self.openai = openai
-        self.client = openai.OpenAI()
+        self.client = openai.OpenAI(max_retries=0)  # один запрос без повторов: при сбое API сразу остановка
         self.questions = build_questions(criteria)
         self.model, self.keep, self.drop, self.workers = model, keep, drop, workers
 
     def classify(self, v: Vacancy) -> Verdict:
         try:
             resp = self.client.decisions.create(model=self.model, input=card_text(v), questions=self.questions)
-        except (self.openai.AuthenticationError, self.openai.NotFoundError, self.openai.PermissionDeniedError):
-            raise  # неверный ключ или модель — продолжать бессмысленно
         except self.openai.APIError as exc:
-            return Verdict(None, error=f'{type(exc).__name__}: {exc}'[:200])
+            # Любой сбой API (нет кредитов, лимит, ключ, модель) — остановка всей работы, а не ошибка на каждую вакансию.
+            raise ClassifierError(f'{type(exc).__name__}: {exc}'[:300]) from exc
         answers = {a.name: a for a in resp.answers}
         pred, level = answers.get('matches'), answers.get('level')
         if pred is None or pred.type == 'refusal':
@@ -77,6 +80,14 @@ class DecisionsClassifier:
         return Verdict(pred.probability, LEVELS.get(level.choice, '') if level is not None and level.type == 'choice' else '')
 
     def classify_many(self, vacancies: list[Vacancy]) -> dict[str, Verdict]:
-        """Один запрос на вакансию, параллельно в несколько потоков."""
-        with ThreadPoolExecutor(self.workers) as pool:
-            return dict(zip((v.key for v in vacancies), pool.map(self.classify, vacancies)))
+        """Один запрос на вакансию, параллельно в несколько потоков.
+        Первая вакансия — отдельным запросом: если API недоступен, падаем после одного вызова, а не после пачки."""
+        if not vacancies:
+            return {}
+        first = self.classify(vacancies[0])
+        pool = ThreadPoolExecutor(self.workers)
+        try:
+            rest = list(pool.map(self.classify, vacancies[1:]))
+        finally:
+            pool.shutdown(cancel_futures=True)  # при ошибке не отправлять оставшиеся запросы
+        return dict(zip((v.key for v in vacancies), [first, *rest]))
