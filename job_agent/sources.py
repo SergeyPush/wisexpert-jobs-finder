@@ -126,6 +126,11 @@ def parse_work_listing(page: str, city: str) -> list[tuple[Vacancy, datetime | N
     return result
 
 
+def work_no_results(page: str) -> bool:
+    """Страница work.ua «За вашим запитом … вакансій поки немає» (проверено на живой выдаче)."""
+    return 'ga-search-no-results' in page or 'вакансій поки немає' in page
+
+
 def search_work(fetcher: Fetcher, city: str, now: datetime, max_pages: int = 30) -> list[Vacancy]:
     slug = CITIES[city].work_slug
     today = now.date().isoformat()
@@ -136,7 +141,8 @@ def search_work(fetcher: Fetcher, city: str, now: datetime, max_pages: int = 30)
         body = fetcher.get(url).text
         cards = parse_work_listing(body, city)
         if not cards:
-            if page == 1 and 'не знайдено' not in body.lower():
+            # Пустая выдача без признака «ничего не найдено» — это блокировка или новая разметка, а не 0 вакансий.
+            if page == 1 and not work_no_results(body):
                 raise SourceError(f'{url}: карточки не найдены — возможно, изменилась разметка')
             break
         for vac, posted in cards:

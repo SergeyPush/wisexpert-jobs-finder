@@ -236,7 +236,8 @@ class SearchWorkTest(unittest.TestCase):
         from job_agent.sources import SourceError, search_work
         with self.assertRaises(SourceError):
             search_work(FakeFetcher({1: '<html>капча</html>'}), 'Киев', NOW)
-        self.assertEqual(search_work(FakeFetcher({1: 'Вакансій не знайдено'}), 'Киев', NOW), [])
+        empty = '<div class="ga-search-no-results">За вашим запитом «бухгалтер» вакансій поки немає.</div>'
+        self.assertEqual(search_work(FakeFetcher({1: empty}), 'Киев', NOW), [])
 
     def test_bad_robota_card_is_skipped(self):
         import contextlib
