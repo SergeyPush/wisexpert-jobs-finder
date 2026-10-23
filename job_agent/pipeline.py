@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from .sources import Fetcher, SourceError, search
-from .storage import make_row
+from .storage import make_row, vacancy_id
 
 # Что делать со спорными (вероятность между порогами): сохранить с пометкой «проверить» или отбросить.
 REVIEW_ACTIONS = ('save', 'drop')
@@ -30,7 +30,7 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
                    max_pages: int = 30, review: str = 'save', verbose: bool = False) -> tuple[list[str], dict]:
     """Возвращает (строки отчёта по каждому сайту и городу, общие счётчики).
     total['problems'] — ошибки источников и предупреждения о подозрительном нуле, для уведомления."""
-    known = store.known_urls()
+    known = store.known_ids()
     total = {'found': 0, 'saved': 0, 'review': 0, 'dropped': 0, 'errors': 0, 'problems': []}
     found_by: dict[tuple[str, str], int] = {}
     report = []
@@ -46,7 +46,7 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
                 print(line, flush=True)
                 continue
             found_by[(source, city)] = len(found)
-            fresh = [v for v in found if v.url not in known]
+            fresh = [v for v in found if vacancy_id(v.url) not in known]
             verdicts = classifier.classify_many(fresh)
             rows, counts = [], {'keep': 0, 'review': 0, 'drop': 0}
             for v in fresh:
@@ -55,7 +55,7 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
                 # Без ответа классификатора (сбой, отказ) вакансию не выбрасываем: завтра она уже вне 24 часов.
                 if decision == 'review' and review == 'drop' and not vd.error:
                     decision = 'drop'
-                known.add(v.url)  # решена — в другом городе/повторно в этот день не классифицируем
+                known.add(vacancy_id(v.url))  # решена — в другом городе/повторно в этот день не классифицируем
                 counts[decision] += 1
                 if verbose:
                     prob = f'{vd.probability:.2f}' if vd.probability is not None else ' -- '

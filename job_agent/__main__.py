@@ -113,7 +113,9 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
         if not sheet_id:
             parser.error('для --sheets задайте GOOGLE_SHEET_ID в .env')
         try:
-            store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии')), 'Google Sheets'
+            # Старые листы через запятую — для поиска дубликатов, туда ничего не пишется.
+            archive = [n.strip() for n in env('GOOGLE_ARCHIVE_WORKSHEETS').split(',') if n.strip()]
+            store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии'), archive), 'Google Sheets'
         except Exception as exc:  # нет доступа, неверный ID, несовместимые колонки
             return fail(f'Google Sheets ({type(exc).__name__}): {exc}')
     else:
@@ -127,7 +129,7 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
           f'спорные: {"сохранять с пометкой «проверить»" if review == "save" else "отбрасывать"}. '
           f'Результаты: {target}', flush=True)
     try:
-        store.known_urls()  # несовместимый CSV/лист — ошибка до первых запросов к сайтам и API
+        store.known_ids()  # несовместимый CSV/лист — ошибка до первых запросов к сайтам и API
     except RuntimeError as exc:
         return fail(str(exc))
     try:

@@ -35,8 +35,9 @@ class FakeStore:
     def __init__(self, known=()):
         self.rows, self.known = [], set(known)
 
-    def known_urls(self):
-        return set(self.known)
+    def known_ids(self):
+        from job_agent.storage import vacancy_id
+        return {vacancy_id(u) for u in self.known}
 
     def append(self, rows):
         self.rows += rows
@@ -86,7 +87,7 @@ class StorageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             store = CsvStore(str(Path(d) / 'jobs.csv'))
             store.append([['a', 'b', 'c', 'd', '=HYPERLINK()', 'f', 'g', '', '', 'h', 'классификатор', 'https://x/1']])
-            self.assertEqual(store.known_urls(), {'https://x/1'})
+            self.assertEqual(store.known_ids(), {'https://x/1'})
             self.assertIn("'=HYPERLINK()", (Path(d) / 'jobs.csv').read_text(encoding='utf-8-sig'))
 
     def test_csv_old_header_is_not_mixed(self):
@@ -96,7 +97,7 @@ class StorageTest(unittest.TestCase):
             store = CsvStore(str(path))
             # Несовместимый файл обнаруживается уже при чтении, до запросов к API.
             with self.assertRaises(RuntimeError):
-                store.known_urls()
+                store.known_ids()
             with self.assertRaises(RuntimeError):
                 store.append([['row']])
 
@@ -370,6 +371,56 @@ class SafetyTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {'gspread': gspread}), self.assertRaises(RuntimeError):
             GoogleSheet('id', 'creds.json')
         ws.update.assert_not_called()  # старый лист не перезаписан
+
+    def test_vacancy_id(self):
+        from job_agent.storage import vacancy_id
+        self.assertEqual(vacancy_id('https://www.work.ua/jobs/5056087/'), 'work_5056087')
+        # id компании в ссылке robota.ua не влияет на ключ
+        self.assertEqual(vacancy_id('https://robota.ua/company1/vacancy10464707'), 'robota_10464707')
+        self.assertEqual(vacancy_id('https://robota.ua/company2/vacancy10464707'), 'robota_10464707')
+
+    def test_archive_ids(self):
+        from job_agent.storage import archive_ids
+        rows = [['Дата', 'id', 'Ссылка'], ['x', 'robota_1', ''], ['x', ' work_2 ', ''], ['x', '', '']]
+        self.assertEqual(archive_ids(rows, 'Лист2'), {'robota_1', 'work_2'})
+        # без колонки id — берутся ссылки
+        self.assertEqual(archive_ids([['Ссылка'], ['https://www.work.ua/jobs/3/']], 'A'), {'work_3'})
+        with self.assertRaises(RuntimeError):
+            archive_ids([['Дата']], 'B')
+
+    def test_sheet_dedup_includes_archive(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import SHEET_HEADER, GoogleSheet
+        ws, old = mock.MagicMock(), mock.MagicMock()
+        ws.row_values.return_value = SHEET_HEADER
+        ws.col_values.return_value = ['Ссылка', 'https://robota.ua/company1/vacancy5']
+        old.title, old.get_all_values.return_value = 'Лист2', [['id'], ['work_7']]
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.side_effect = (
+            lambda name: old if name == 'Лист2' else ws)
+        with mock.patch.dict(sys.modules, {'gspread': gspread}):
+            sheet = GoogleSheet('id', 'creds.json', archive=['Лист2'])
+        self.assertEqual(sheet.known_ids(), {'robota_5', 'work_7'})
+        old.append_rows.assert_not_called()  # в архивный лист не пишем
+
+    def test_sheet_hides_classifier_columns(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import HEADER, SHEET_HEADER, GoogleSheet
+        ws = mock.MagicMock()
+        ws.row_values.return_value = []  # новый пустой лист
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.return_value = ws
+        with mock.patch.dict(sys.modules, {'gspread': gspread}):
+            sheet = GoogleSheet('id', 'creds.json')
+        ws.update.assert_called_once_with([SHEET_HEADER], 'A1')
+        for col in ('Уровень', 'Вероятность', 'Решил'):
+            self.assertNotIn(col, SHEET_HEADER)
+        sheet.append([HEADER])  # строка-образец: значение = имя колонки
+        self.assertEqual(ws.append_rows.call_args[0][0], [SHEET_HEADER])
 
 
 class MonitoringTest(unittest.TestCase):
