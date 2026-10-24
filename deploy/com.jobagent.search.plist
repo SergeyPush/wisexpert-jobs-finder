@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ежедневный запуск на Mac (launchd). Пути — под папку проекта; при переносе поправить.
+  Установка:  cp deploy/com.jobagent.search.plist ~/Library/LaunchAgents/
+              launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jobagent.search.plist
+  Запуск сейчас: launchctl kickstart gui/$(id -u)/com.jobagent.search
+  Отключить:  launchctl bootout gui/$(id -u)/com.jobagent.search
+  Время — по часовому поясу Mac. Если Mac спал, запуск произойдёт после пробуждения;
+  если был выключен — пропускается.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jobagent.search</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/sergey/Desktop/ai/job-search-agent/.venv/bin/python</string>
+        <string>-m</string>
+        <string>job_agent</string>
+        <string>--sheets</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/sergey/Desktop/ai/job-search-agent</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <!-- Лог вне Desktop: launchd-задачам доступ к Desktop может быть закрыт macOS -->
+    <key>StandardOutPath</key>
+    <string>/Users/sergey/Library/Logs/job-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sergey/Library/Logs/job-agent.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -87,7 +87,23 @@ CSV в UTF-8 с BOM — открывается в Excel. Каждый запус
 
 `TELEGRAM_NOTIFY=problems` (по умолчанию) — сообщение только при проблемах; `always` — ещё и ежедневная сводка. Ошибка отправки в Telegram не роняет запуск.
 
+## Ежедневный запуск на Mac (launchd)
+
+С домашнего IP оба сайта отдают вакансии без блокировок. Запуск в 09:00 по часовому поясу Mac, результаты — в Google Sheets:
+
+```sh
+cp deploy/com.jobagent.search.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jobagent.search.plist
+launchctl kickstart gui/$(id -u)/com.jobagent.search   # запустить сейчас
+tail -f ~/Library/Logs/job-agent.log                   # лог
+launchctl bootout gui/$(id -u)/com.jobagent.search     # отключить
+```
+
+Пути в plist — под `~/Desktop/ai/job-search-agent`; при переносе проекта поправить. Если Mac спал — запуск после пробуждения, если был выключен — пропускается. Если в логе `Operation not permitted`, дать Python доступ к папке Desktop: Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску → добавить `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13`.
+
 ## Деплой на VPS (Ubuntu/Debian)
+
+На IP дата-центров Cloudflare блокирует часть запросов (на Hostinger robota.ua не отдавал вакансии совсем) — без `PROXY_URL` надёжнее запуск на Mac.
 
 ```sh
 sudo useradd -r -m -d /opt/job-search-agent jobagent
