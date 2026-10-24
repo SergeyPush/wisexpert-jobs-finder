@@ -95,8 +95,9 @@ sudo -u jobagent git clone <repo> /opt/job-search-agent   # или scp папк�
 cd /opt/job-search-agent
 curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh   # uv один раз на сервер
 sudo -u jobagent uv sync --frozen   # ровно версии из uv.lock
-# положить .env (и service-account.json для --sheets), chmod 600
+# положить .env и service-account.json (scp, не через git): chown jobagent, chmod 600
 sudo -u jobagent uv run main.py --check   # убедиться, что сайты не блокируют IP сервера
+sudo -u jobagent uv run main.py --sheets --cities Ужгород   # проверить запись в таблицу
 
 sudo cp deploy/job-agent.service deploy/job-agent.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now job-agent.timer

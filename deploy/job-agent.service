@@ -7,4 +7,5 @@ Wants=network-online.target
 Type=oneshot
 User=jobagent
 WorkingDirectory=/opt/job-search-agent
-ExecStart=/opt/job-search-agent/.venv/bin/python -m job_agent
+# --sheets — результаты в Google Sheets (нужны service-account.json и GOOGLE_SHEET_ID в .env)
+ExecStart=/opt/job-search-agent/.venv/bin/python -m job_agent --sheets
