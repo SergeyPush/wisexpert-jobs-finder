@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import CITIES, KYIV, SOURCES, env, load_criteria, load_dotenv
-from .sources import Fetcher, SourceError, search
+from .sources import Fetcher
 from .notify import notify, send_telegram, telegram_configured
 from .storage import CsvStore, GoogleSheet, write_snapshot
 
@@ -28,35 +28,35 @@ def check_sources(args, now: datetime) -> int:
     """Проверка без сохранения: сколько вакансий видно в каждом источнике.
     С --classify ещё и показывает решения классификатора — для подбора критериев и порогов.
     С --save пишет все найденные вакансии (и решения, если --classify) в CSV — для сравнения «до и после»."""
+    from .pipeline import search_all
+
     fetcher = Fetcher(delay=args.delay, proxy=env('PROXY_URL'))
     classifier = make_classifier() if args.classify else None
     snapshot = []  # (вакансия, Verdict или None, решение)
     failed = False
-    for source in args.sources:
-        for city in args.cities:
-            try:
-                found = search(fetcher, source, city, now, args.max_pages)
-            except SourceError as exc:
-                failed = True
-                print(f'{source} · {city}: ОШИБКА {exc}')
-                continue
-            print(f'{source} · {city}: {len(found)} за 24ч')
-            if classifier is None:
-                snapshot += [(v, None, '') for v in found]
-                for v in found[:3]:
-                    print(f'   {v.posted} {v.title} — {v.company}')
-                continue
-            try:
-                verdicts = classifier.classify_many(found)
-            except Exception as exc:  # неверный ключ, нет доступа к модели — дальше проверять бессмысленно
-                print(f'Ошибка классификатора ({type(exc).__name__}): {exc}', file=sys.stderr)
-                return 1
-            for v in sorted(found, key=lambda v: -(verdicts[v.key].probability or 0)):
-                vd = verdicts[v.key]
-                decision = vd.decision(classifier.keep, classifier.drop)
-                snapshot.append((v, vd, DECISIONS[decision]))
-                prob = f'{vd.probability:.2f}' if vd.probability is not None else ' -- '
-                print(f'   {MARKS[decision]} {prob} {vd.level or vd.error:<14} {v.title}')
+    for source, city, found, exc in search_all(fetcher, args.sources, args.cities, now, args.max_pages,
+                                               args.retry_wait):
+        if exc is not None:
+            failed = True
+            print(f'{source} · {city}: ОШИБКА {exc}')
+            continue
+        print(f'{source} · {city}: {len(found)} за 24ч')
+        if classifier is None:
+            snapshot += [(v, None, '') for v in found]
+            for v in found[:3]:
+                print(f'   {v.posted} {v.title} — {v.company}')
+            continue
+        try:
+            verdicts = classifier.classify_many(found)
+        except Exception as exc:  # неверный ключ, нет доступа к модели — дальше проверять бессмысленно
+            print(f'Ошибка классификатора ({type(exc).__name__}): {exc}', file=sys.stderr)
+            return 1
+        for v in sorted(found, key=lambda v: -(verdicts[v.key].probability or 0)):
+            vd = verdicts[v.key]
+            decision = vd.decision(classifier.keep, classifier.drop)
+            snapshot.append((v, vd, DECISIONS[decision]))
+            prob = f'{vd.probability:.2f}' if vd.probability is not None else ' -- '
+            print(f'   {MARKS[decision]} {prob} {vd.level or vd.error:<14} {v.title}')
     if args.save:
         write_snapshot(args.save, snapshot, with_verdicts=classifier is not None)
         print(f'Сохранено {len(snapshot)} вакансий → {Path(args.save).resolve()}')
@@ -72,7 +72,9 @@ def main() -> int:
     parser.add_argument('--output', default=env('OUTPUT_CSV', 'jobs.csv'), help='CSV-файл с результатами')
     parser.add_argument('--sheets', action='store_true', help='Писать в Google Sheets вместо CSV')
     parser.add_argument('--max-pages', type=int, default=30, help='Лимит страниц выдачи на сайт и город')
-    parser.add_argument('--delay', type=float, default=1.5, help='Пауза между запросами к сайтам, секунды')
+    parser.add_argument('--delay', type=float, default=6, help='Пауза между запросами к сайтам, секунды')
+    parser.add_argument('--retry-wait', type=float, default=150,
+                        help='Через сколько секунд повторить источники с ошибкой (0 — без повтора)')
     parser.add_argument('--check', action='store_true', help='Только проверить сбор, без сохранения')
     parser.add_argument('--classify', action='store_true', help='С --check: показать решения классификатора')
     parser.add_argument('--save', metavar='CSV', help='С --check: сохранить все найденные вакансии (и решения) в CSV')
@@ -135,7 +137,8 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
     try:
         _, total = run_classifier(store, args.cities, args.sources, now, classifier,
                                   fetcher=Fetcher(delay=args.delay, proxy=env('PROXY_URL')),
-                                  max_pages=args.max_pages, review=review, verbose=args.verbose)
+                                  max_pages=args.max_pages, review=review, verbose=args.verbose,
+                                  retry_wait=args.retry_wait)
     except Exception as exc:  # неверный ключ, нет доступа к модели и т.п.
         return fail(f'Ошибка классификатора ({type(exc).__name__}): {exc}')
     summary = (f"[{now:%Y-%m-%d %H:%M}] Подходит: {total['saved']}, проверить: {total['review']}, "

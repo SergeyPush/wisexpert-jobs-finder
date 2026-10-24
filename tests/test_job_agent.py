@@ -455,6 +455,33 @@ class MonitoringTest(unittest.TestCase):
         self.assertEqual(total['errors'], 1)
         self.assertIn('HTTP 403', total['problems'][0])
 
+    def test_failed_sources_retried_once_with_new_session(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        import job_agent.pipeline as pipeline
+        from job_agent.sources import SourceError
+
+        calls = []
+
+        def flaky(fetcher, source, city, *a):
+            # Киев блокируется только в первый раз, Львов — всегда
+            calls.append(city)
+            if city == 'Львов' or calls.count(city) == 1 and city == 'Киев':
+                raise SourceError('HTTP 403 (Cloudflare challenge)')
+            return []
+
+        fetcher = mock.MagicMock()
+        with mock.patch.object(pipeline, 'search', flaky), mock.patch.object(pipeline.time, 'sleep') as sleep, \
+                contextlib.redirect_stdout(io.StringIO()):
+            got = list(pipeline.search_all(fetcher, ['work.ua'], ['Киев', 'Одесса', 'Львов'], NOW, 1, retry_wait=150))
+        self.assertEqual(calls, ['Киев', 'Одесса', 'Львов', 'Киев', 'Львов'])
+        sleep.assert_called_once_with(150)
+        fetcher.reset.assert_called_once()  # повтор — с новой сессией
+        errors = {city: exc is not None for _, city, _, exc in got}
+        self.assertEqual(errors, {'Киев': False, 'Одесса': False, 'Львов': True})
+
     def test_notify_modes_and_payload(self):
         import os
         from unittest import mock

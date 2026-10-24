@@ -43,10 +43,16 @@ def text(fragment: str) -> str:
 class Fetcher:
     """HTTP-клиент с TLS-отпечатком Chrome (нужно для Cloudflare на work.ua), паузами и повторами."""
 
-    def __init__(self, delay: float = 1.5, proxy: str = ''):
+    def __init__(self, delay: float = 6, proxy: str = ''):
         self.delay = delay
-        self.session = requests.Session(impersonate='chrome', proxies={'https': proxy, 'http': proxy} if proxy else None)
+        self.proxy = proxy
+        self.reset()
         self.last = 0.0
+
+    def reset(self) -> None:
+        """Новая сессия без cookies — после блокировки Cloudflare старая сессия часто остаётся «подозрительной»."""
+        proxies = {'https': self.proxy, 'http': self.proxy} if self.proxy else None
+        self.session = requests.Session(impersonate='chrome', proxies=proxies)
 
     def get(self, url: str, retries: int = 3) -> requests.Response:
         for attempt in range(retries):
