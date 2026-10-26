@@ -75,10 +75,10 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
         found_by[(source, city)] = len(found)
         fresh = [v for v in found if vacancy_id(v.url) not in known]
         verdicts = classifier.classify_many(fresh)
-        rows, counts = [], {'keep': 0, 'review': 0, 'drop': 0}
+        rows, dropped, counts = [], [], {'keep': 0, 'review': 0, 'drop': 0}
         for v in fresh:
             vd = verdicts[v.key]
-            decision = vd.decision(classifier.keep, classifier.drop)
+            decision = original = vd.decision(classifier.keep, classifier.drop)
             # Без ответа классификатора (сбой, отказ) вакансию не выбрасываем: завтра она уже вне 24 часов.
             if decision == 'review' and review == 'drop' and not vd.error:
                 decision = 'drop'
@@ -89,10 +89,13 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
                 mark = {'keep': '✔', 'review': '?', 'drop': '✘'}[decision]
                 print(f'   {mark} {prob} {v.title} — {v.company}', flush=True)
             if decision == 'drop':
+                # Отсеянные — на отдельный лист: видно, что и с какой вероятностью отбросил классификатор.
+                dropped.append(make_row(now, v, vd, v.snippet, 'отброшена' if original == 'drop' else 'спорная'))
                 continue
             # «Кратко» — начало описания с сайта; спорные помечены для ручной проверки.
             rows.append(make_row(now, v, vd, v.snippet, 'классификатор' if decision == 'keep' else 'проверить'))
         store.append(rows)
+        store.append_dropped(dropped)
         errors = sum(1 for v in fresh if verdicts[v.key].error)
         total['found'] += len(found)
         total['saved'] += counts['keep']

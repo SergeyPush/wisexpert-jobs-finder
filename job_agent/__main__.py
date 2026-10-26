@@ -118,11 +118,16 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
         try:
             # Старые листы через запятую — для поиска дубликатов, туда ничего не пишется.
             archive = [n.strip() for n in env('GOOGLE_ARCHIVE_WORKSHEETS').split(',') if n.strip()]
-            store, target = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии'), archive), 'Google Sheets'
+            store = GoogleSheet(sheet_id, creds, env('GOOGLE_WORKSHEET', 'Вакансии'), archive,
+                                dropped=env('GOOGLE_DROPPED_WORKSHEET', 'Отсеянные'))
+            target = 'Google Sheets'
         except Exception as exc:  # нет доступа, неверный ID, несовместимые колонки
             return fail(f'Google Sheets ({type(exc).__name__}): {exc}')
     else:
-        store, target = CsvStore(args.output), str(Path(args.output).resolve())
+        # Отсеянные — рядом с основным файлом: jobs.csv → jobs_dropped.csv.
+        output = Path(args.output)
+        store, target = CsvStore(args.output, str(output.with_name(f'{output.stem}_dropped{output.suffix}'))), \
+            str(output.resolve())
 
     try:
         classifier = make_classifier()

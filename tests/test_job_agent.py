@@ -33,7 +33,7 @@ WORK_HTML = '''
 
 class FakeStore:
     def __init__(self, known=()):
-        self.rows, self.known = [], set(known)
+        self.rows, self.dropped, self.known = [], [], set(known)
 
     def known_ids(self):
         from job_agent.storage import vacancy_id
@@ -41,6 +41,9 @@ class FakeStore:
 
     def append(self, rows):
         self.rows += rows
+
+    def append_dropped(self, rows):
+        self.dropped += rows
 
 
 class ParsingTest(unittest.TestCase):
@@ -210,6 +213,9 @@ class PipelineTest(unittest.TestCase):
                          [('классификатор', 'https://www.work.ua/jobs/1/'), ('проверить', 'https://www.work.ua/jobs/3/')])
         self.assertEqual((total['found'], total['saved'], total['review'], total['dropped']), (4, 1, 1, 1))
         self.assertIn('новых 3', report[0])
+        # Отсеянная — на отдельном листе, с вероятностью и статусом.
+        self.assertEqual([(r[8], r[-2], r[-1]) for r in store.dropped],
+                         [('0.10', 'отброшена', 'https://www.work.ua/jobs/2/')])
 
     def test_classifier_error_kept_even_with_drop(self):
         import job_agent.pipeline as pipeline
@@ -236,6 +242,21 @@ class PipelineTest(unittest.TestCase):
         store, _, total = self.run_pipeline('drop')
         self.assertEqual(len(store.rows), 1)
         self.assertEqual((total['review'], total['dropped']), (0, 2))
+        self.assertEqual([r[-2] for r in store.dropped], ['отброшена', 'спорная'])
+
+    def test_csv_dropped_file(self):
+        import tempfile
+
+        from job_agent.storage import DROPPED_HEADER, HEADER
+        with tempfile.TemporaryDirectory() as d:
+            store = CsvStore(str(Path(d) / 'jobs.csv'), str(Path(d) / 'jobs_dropped.csv'))
+            row = [''] * len(HEADER)
+            row[HEADER.index('Решил')], row[HEADER.index('Ссылка')] = 'отброшена', 'https://www.work.ua/jobs/9/'
+            store.append_dropped([row])
+            self.assertFalse((Path(d) / 'jobs.csv').exists())  # в основной файл не попала
+            lines = (Path(d) / 'jobs_dropped.csv').read_text(encoding='utf-8-sig').splitlines()
+            self.assertEqual(lines[0].split(','), DROPPED_HEADER)
+            self.assertEqual(store.known_ids(), {'work_9'})  # отсеянная повторно не классифицируется
 
 
 class SnapshotTest(unittest.TestCase):
@@ -445,6 +466,27 @@ class SafetyTest(unittest.TestCase):
         self.assertEqual(ws.append_rows.call_count, 2)
         retried = ws.append_rows.call_args[0][0]
         self.assertEqual([r[SHEET_HEADER.index('Ссылка')] for r in retried], ['https://www.work.ua/jobs/2/'])
+
+    def test_sheet_dropped_worksheet(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import DROPPED_HEADER, HEADER, SHEET_HEADER, GoogleSheet
+        main, dropped = mock.MagicMock(), mock.MagicMock()
+        main.row_values.return_value = SHEET_HEADER
+        dropped.row_values.return_value = []  # новый лист — получит заголовок
+        main.col_values.return_value = ['Ссылка']
+        dropped.col_values.return_value = ['Ссылка', 'https://www.work.ua/jobs/5/']
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.side_effect = (
+            lambda name: dropped if name == 'Отсеянные' else main)
+        with mock.patch.dict(sys.modules, {'gspread': gspread}):
+            sheet = GoogleSheet('id', 'creds.json', dropped='Отсеянные')
+        dropped.update.assert_called_once_with([DROPPED_HEADER], 'A1')
+        self.assertEqual(sheet.known_ids(), {'work_5'})  # отсеянные тоже не классифицируются повторно
+        sheet.append_dropped([HEADER])  # строка-образец: значение = имя колонки
+        self.assertEqual(dropped.append_rows.call_args[0][0], [HEADER])  # все колонки, «Решил» → «Статус»
+        main.append_rows.assert_not_called()
 
     def test_sheet_permanent_error_not_retried(self):
         import sys

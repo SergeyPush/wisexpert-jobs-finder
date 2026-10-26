@@ -10,6 +10,9 @@ HEADER = ['Найдено', 'Опубликовано', 'Сайт', 'Город'
           'Кратко', 'Решил', 'Ссылка']
 # В Google Sheets служебные колонки классификатора не показываются — они остаются только в CSV.
 SHEET_HEADER = [c for c in HEADER if c not in ('Уровень', 'Вероятность', 'Решил')]
+# Лист/файл отсеянных: все колонки; «Решил» там — «Статус» (отброшена / спорная).
+RENAMED = {'Статус': 'Решил'}  # колонка листа → колонка HEADER, откуда берётся значение
+DROPPED_HEADER = ['Статус' if c == 'Решил' else c for c in HEADER]
 
 # Google Sheets иногда не отвечает: без таймаута gspread ждёт бесконечно, один сбой не должен ронять запуск.
 SHEETS_TIMEOUT = 60  # секунд на запрос
@@ -73,55 +76,76 @@ def check_header(header: list[str], where: str, expected: list[str] = HEADER) ->
         raise RuntimeError(f'{where}: старый набор колонок — переименуйте файл/лист, будет создан новый')
 
 
+def open_worksheet(book, name: str, header: list[str], not_found) -> object:
+    """Лист name; нет — создаётся с заголовком header. Лист с другим набором колонок — ошибка."""
+    try:
+        ws = book.worksheet(name)
+    except not_found:
+        ws = book.add_worksheet(name, rows=1000, cols=len(header))
+    current = ws.row_values(1)
+    check_header(current, f'лист «{name}»', header)
+    if not current:
+        ws.update([header], 'A1')
+        ws.freeze(rows=1)
+    return ws
+
+
+def worksheet_ids(ws, header: list[str]) -> set[str]:
+    """id вакансий, уже записанных в лист."""
+    return {vacancy_id(u) for u in ws.col_values(header.index('Ссылка') + 1)[1:] if u}
+
+
+def append_to_worksheet(ws, header: list[str], rows: list[list[str]]) -> None:
+    """Строки, собранные под HEADER, → лист с колонками header. С повторами при сбоях и без дублей."""
+    if not rows:
+        return
+    # Оставляем только колонки листа, в его порядке.
+    cols = [HEADER.index(RENAMED.get(c, c)) for c in header]
+    values = [[safe(r[i]) for i in cols] for r in rows]
+    link = header.index('Ссылка')
+
+    def write(attempt: int) -> None:
+        pending = values
+        if attempt:
+            # Таймаут не значит, что строки не записались: уже попавшие в лист не дублируем.
+            saved = worksheet_ids(ws, header)
+            pending = [r for r in values if vacancy_id(r[link]) not in saved]
+        if pending:
+            # RAW — значения пишутся как есть, без интерпретации формул.
+            ws.append_rows(pending, value_input_option='RAW')
+
+    sheets_retry(write)
+
+
 class GoogleSheet:
     def __init__(self, spreadsheet_id: str, credentials_file: str, worksheet: str = 'Вакансии',
-                 archive: list[str] = ()):
-        """archive — старые листы (только чтение): их вакансии тоже считаются уже сохранёнными."""
+                 archive: list[str] = (), dropped: str = ''):
+        """archive — старые листы (только чтение): их вакансии тоже считаются уже сохранёнными.
+        dropped — лист для отсеянных классификатором вакансий (с вероятностью и уровнем); '' — не писать."""
         import gspread  # импорт здесь, чтобы --dry-run работал без настроенного Google
 
         client = gspread.service_account(filename=credentials_file)
         client.set_timeout(SHEETS_TIMEOUT)
         book = client.open_by_key(spreadsheet_id)
         self.archive = [book.worksheet(name) for name in archive]  # нет листа — ошибка сразу
-        try:
-            self.ws = book.worksheet(worksheet)
-        except gspread.WorksheetNotFound:
-            self.ws = book.add_worksheet(worksheet, rows=1000, cols=len(SHEET_HEADER))
-        header = self.ws.row_values(1)
-        check_header(header, f'лист «{worksheet}»', SHEET_HEADER)
-        if not header:
-            self.ws.update([SHEET_HEADER], 'A1')
-            self.ws.freeze(rows=1)
-
-    def sheet_ids(self) -> set[str]:
-        """id вакансий, уже записанных в рабочий лист."""
-        return {vacancy_id(u) for u in self.ws.col_values(SHEET_HEADER.index('Ссылка') + 1)[1:] if u}
+        self.ws = open_worksheet(book, worksheet, SHEET_HEADER, gspread.WorksheetNotFound)
+        self.dropped_ws = open_worksheet(book, dropped, DROPPED_HEADER, gspread.WorksheetNotFound) if dropped else None
 
     def known_ids(self) -> set[str]:
-        ids = sheets_retry(lambda _: self.sheet_ids())
+        """Уже сохранённые и уже отсеянные вакансии: ни те, ни другие повторно не классифицируются."""
+        ids = sheets_retry(lambda _: worksheet_ids(self.ws, SHEET_HEADER))
+        if self.dropped_ws is not None:
+            ids |= sheets_retry(lambda _: worksheet_ids(self.dropped_ws, DROPPED_HEADER))
         for ws in self.archive:
             ids |= archive_ids(sheets_retry(lambda _: ws.get_all_values()), ws.title)
         return ids
 
     def append(self, rows: list[list[str]]) -> None:
-        if not rows:
-            return
-        # Строки собраны под HEADER — оставляем только колонки листа.
-        cols = [HEADER.index(c) for c in SHEET_HEADER]
-        values = [[safe(r[i]) for i in cols] for r in rows]
-        link = SHEET_HEADER.index('Ссылка')
+        append_to_worksheet(self.ws, SHEET_HEADER, rows)
 
-        def write(attempt: int) -> None:
-            pending = values
-            if attempt:
-                # Таймаут не значит, что строки не записались: уже попавшие в лист не дублируем.
-                saved = self.sheet_ids()
-                pending = [r for r in values if vacancy_id(r[link]) not in saved]
-            if pending:
-                # RAW — значения пишутся как есть, без интерпретации формул.
-                self.ws.append_rows(pending, value_input_option='RAW')
-
-        sheets_retry(write)
+    def append_dropped(self, rows: list[list[str]]) -> None:
+        if self.dropped_ws is not None:
+            append_to_worksheet(self.dropped_ws, DROPPED_HEADER, rows)
 
 
 def archive_ids(rows: list[list[str]], title: str) -> set[str]:
@@ -136,36 +160,54 @@ def archive_ids(rows: list[list[str]], title: str) -> set[str]:
     return {convert(r[col]) for r in rows[1:] if len(r) > col and r[col].strip()}
 
 
+def csv_ids(path: Path, header: list[str]) -> set[str]:
+    """id вакансий из CSV. Заодно проверяет заголовок — несовместимый файл обнаружится до запросов к API."""
+    if not path.exists():
+        return set()
+    with path.open(encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return set()
+    check_header(rows[0], str(path), header)
+    col = header.index('Ссылка')
+    return {vacancy_id(row[col]) for row in rows[1:] if len(row) > col}
+
+
+def csv_append(path: Path, header: list[str], rows: list[list[str]]) -> None:
+    """Дописать строки (собранные под HEADER, колонки header в том же порядке) в CSV."""
+    if not rows:
+        return
+    new = not path.exists() or path.stat().st_size == 0
+    if not new:
+        with path.open(encoding='utf-8-sig', newline='') as f:
+            check_header(next(csv.reader(f), []), str(path), header)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8-sig' if new else 'utf-8', newline='') as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(header)
+        w.writerows([[safe(c) for c in r] for r in rows])
+
+
 class CsvStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str, dropped: str = ''):
+        """dropped — CSV для отсеянных классификатором вакансий; '' — не писать."""
         self.path = Path(path)
+        self.dropped = Path(dropped) if dropped else None
 
     def known_ids(self) -> set[str]:
-        """id уже сохранённых вакансий. Вызывается в начале запуска — заодно проверяет заголовок,
-        чтобы несовместимый файл обнаружился до запросов к API."""
-        if not self.path.exists():
-            return set()
-        with self.path.open(encoding='utf-8-sig', newline='') as f:
-            rows = list(csv.reader(f))
-        if not rows:
-            return set()
-        check_header(rows[0], str(self.path))
-        col = HEADER.index('Ссылка')
-        return {vacancy_id(row[col]) for row in rows[1:] if len(row) > col}
+        """Уже сохранённые и уже отсеянные вакансии."""
+        ids = csv_ids(self.path, HEADER)
+        if self.dropped is not None:
+            ids |= csv_ids(self.dropped, DROPPED_HEADER)
+        return ids
 
     def append(self, rows: list[list[str]]) -> None:
-        if not rows:
-            return
-        new = not self.path.exists() or self.path.stat().st_size == 0
-        if not new:
-            with self.path.open(encoding='utf-8-sig', newline='') as f:
-                check_header(next(csv.reader(f), []), str(self.path))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open('a', encoding='utf-8-sig' if new else 'utf-8', newline='') as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(HEADER)
-            w.writerows([[safe(c) for c in r] for r in rows])
+        csv_append(self.path, HEADER, rows)
+
+    def append_dropped(self, rows: list[list[str]]) -> None:
+        if self.dropped is not None:
+            csv_append(self.dropped, DROPPED_HEADER, rows)
 
 
 SNAPSHOT_HEADER = ['Сайт', 'Город', 'Опубликовано', 'Должность', 'Компания', 'Зарплата', 'Кратко', 'Ссылка']
