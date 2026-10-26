@@ -3,12 +3,42 @@ from __future__ import annotations
 
 import csv
 import re
+import time
 from pathlib import Path
 
 HEADER = ['Найдено', 'Опубликовано', 'Сайт', 'Город', 'Должность', 'Компания', 'Зарплата', 'Уровень', 'Вероятность',
           'Кратко', 'Решил', 'Ссылка']
 # В Google Sheets служебные колонки классификатора не показываются — они остаются только в CSV.
 SHEET_HEADER = [c for c in HEADER if c not in ('Уровень', 'Вероятность', 'Решил')]
+
+# Google Sheets иногда не отвечает: без таймаута gspread ждёт бесконечно, один сбой не должен ронять запуск.
+SHEETS_TIMEOUT = 60  # секунд на запрос
+SHEETS_RETRIES = 3
+SHEETS_RETRY_DELAY = 10.0  # секунд, растёт с каждой попыткой
+
+
+def sheets_transient(exc: Exception) -> bool:
+    """Временный сбой Google Sheets: таймаут, обрыв связи, 429/5xx — есть смысл повторить."""
+    import requests  # приходит вместе с gspread
+
+    if isinstance(exc, requests.RequestException):  # ReadTimeout, ConnectionError
+        return True
+    # gspread.APIError несёт ответ сервера; класс не импортируем — в тестах gspread подменён.
+    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    return status in (429, 500, 502, 503, 504)
+
+
+def sheets_retry(call):
+    """call(attempt) с повторами при временных сбоях Google Sheets; остальные ошибки — сразу наверх."""
+    for attempt in range(SHEETS_RETRIES + 1):
+        try:
+            return call(attempt)
+        except Exception as exc:
+            if attempt == SHEETS_RETRIES or not sheets_transient(exc):
+                raise
+            wait = SHEETS_RETRY_DELAY * (attempt + 1)  # 10, 20, 30 секунд
+            print(f'Google Sheets: {type(exc).__name__}, повтор через {wait:.0f} с', flush=True)
+            time.sleep(wait)
 
 
 # id вакансии из ссылки — в том же формате, что колонка id старых листов (work_N, robota_N).
@@ -49,7 +79,9 @@ class GoogleSheet:
         """archive — старые листы (только чтение): их вакансии тоже считаются уже сохранёнными."""
         import gspread  # импорт здесь, чтобы --dry-run работал без настроенного Google
 
-        book = gspread.service_account(filename=credentials_file).open_by_key(spreadsheet_id)
+        client = gspread.service_account(filename=credentials_file)
+        client.set_timeout(SHEETS_TIMEOUT)
+        book = client.open_by_key(spreadsheet_id)
         self.archive = [book.worksheet(name) for name in archive]  # нет листа — ошибка сразу
         try:
             self.ws = book.worksheet(worksheet)
@@ -61,18 +93,35 @@ class GoogleSheet:
             self.ws.update([SHEET_HEADER], 'A1')
             self.ws.freeze(rows=1)
 
+    def sheet_ids(self) -> set[str]:
+        """id вакансий, уже записанных в рабочий лист."""
+        return {vacancy_id(u) for u in self.ws.col_values(SHEET_HEADER.index('Ссылка') + 1)[1:] if u}
+
     def known_ids(self) -> set[str]:
-        ids = {vacancy_id(u) for u in self.ws.col_values(SHEET_HEADER.index('Ссылка') + 1)[1:] if u}
+        ids = sheets_retry(lambda _: self.sheet_ids())
         for ws in self.archive:
-            ids |= archive_ids(ws.get_all_values(), ws.title)
+            ids |= archive_ids(sheets_retry(lambda _: ws.get_all_values()), ws.title)
         return ids
 
     def append(self, rows: list[list[str]]) -> None:
-        if rows:
-            # Строки собраны под HEADER — оставляем только колонки листа.
-            cols = [HEADER.index(c) for c in SHEET_HEADER]
-            # RAW — значения пишутся как есть, без интерпретации формул.
-            self.ws.append_rows([[safe(r[i]) for i in cols] for r in rows], value_input_option='RAW')
+        if not rows:
+            return
+        # Строки собраны под HEADER — оставляем только колонки листа.
+        cols = [HEADER.index(c) for c in SHEET_HEADER]
+        values = [[safe(r[i]) for i in cols] for r in rows]
+        link = SHEET_HEADER.index('Ссылка')
+
+        def write(attempt: int) -> None:
+            pending = values
+            if attempt:
+                # Таймаут не значит, что строки не записались: уже попавшие в лист не дублируем.
+                saved = self.sheet_ids()
+                pending = [r for r in values if vacancy_id(r[link]) not in saved]
+            if pending:
+                # RAW — значения пишутся как есть, без интерпретации формул.
+                self.ws.append_rows(pending, value_input_option='RAW')
+
+        sheets_retry(write)
 
 
 def archive_ids(rows: list[list[str]], title: str) -> set[str]:

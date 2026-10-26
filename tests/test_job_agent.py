@@ -422,6 +422,44 @@ class SafetyTest(unittest.TestCase):
         sheet.append([HEADER])  # строка-образец: значение = имя колонки
         self.assertEqual(ws.append_rows.call_args[0][0], [SHEET_HEADER])
 
+    def test_sheet_append_retries_without_duplicates(self):
+        import sys
+        from unittest import mock
+
+        import requests
+
+        from job_agent.storage import HEADER, SHEET_HEADER, GoogleSheet
+        ws = mock.MagicMock()
+        ws.row_values.return_value = SHEET_HEADER
+        row1, row2 = [''] * len(HEADER), [''] * len(HEADER)
+        row1[HEADER.index('Ссылка')] = 'https://www.work.ua/jobs/1/'
+        row2[HEADER.index('Ссылка')] = 'https://www.work.ua/jobs/2/'
+        # Первая запись «упала» по таймауту, но строка 1 успела попасть в лист.
+        ws.append_rows.side_effect = [requests.exceptions.ReadTimeout('timed out'), None]
+        ws.col_values.return_value = ['Ссылка', 'https://www.work.ua/jobs/1/']
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.return_value = ws
+        with mock.patch.dict(sys.modules, {'gspread': gspread}), mock.patch('job_agent.storage.time.sleep'):
+            GoogleSheet('id', 'creds.json').append([row1, row2])
+        gspread.service_account.return_value.set_timeout.assert_called_once()
+        self.assertEqual(ws.append_rows.call_count, 2)
+        retried = ws.append_rows.call_args[0][0]
+        self.assertEqual([r[SHEET_HEADER.index('Ссылка')] for r in retried], ['https://www.work.ua/jobs/2/'])
+
+    def test_sheet_permanent_error_not_retried(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import HEADER, SHEET_HEADER, GoogleSheet
+        ws = mock.MagicMock()
+        ws.row_values.return_value = SHEET_HEADER
+        ws.append_rows.side_effect = PermissionError('нет доступа')
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.return_value = ws
+        with mock.patch.dict(sys.modules, {'gspread': gspread}), self.assertRaises(PermissionError):
+            GoogleSheet('id', 'creds.json').append([[''] * len(HEADER)])
+        ws.append_rows.assert_called_once()
+
 
 class MonitoringTest(unittest.TestCase):
     def test_suspicious_zeros(self):

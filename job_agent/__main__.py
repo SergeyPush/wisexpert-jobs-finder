@@ -101,6 +101,7 @@ def main() -> int:
 
 def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
     """Основной запуск. Возвращает (код выхода, проблемы для уведомления, итоговая строка)."""
+    from .classifier import ClassifierError
     from .pipeline import REVIEW_ACTIONS, run_classifier  # импорт тут: --check не требует openai
 
     def fail(message: str) -> tuple[int, list[str], str]:
@@ -139,8 +140,10 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
                                   fetcher=Fetcher(delay=args.delay, proxy=env('PROXY_URL')),
                                   max_pages=args.max_pages, review=review, verbose=args.verbose,
                                   retry_wait=args.retry_wait)
-    except Exception as exc:  # неверный ключ, нет доступа к модели и т.п.
-        return fail(f'Ошибка классификатора ({type(exc).__name__}): {exc}')
+    except ClassifierError as exc:  # неверный ключ, нет кредитов, нет доступа к модели
+        return fail(f'Ошибка классификатора: {exc}')
+    except Exception as exc:  # запись в Google Sheets/CSV не удалась и после повторов, прочие сбои
+        return fail(f'Запуск остановлен ({type(exc).__name__}): {exc}')
     summary = (f"[{now:%Y-%m-%d %H:%M}] Подходит: {total['saved']}, проверить: {total['review']}, "
                f"отброшено: {total['dropped']} из {total['found']} → {target}")
     print(summary)
