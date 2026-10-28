@@ -65,7 +65,7 @@ def check_sources(args, now: datetime) -> int:
             decision = vd.decision(classifier.keep, classifier.drop)
             snapshot.append((v, vd, DECISIONS[decision]))
             prob = f'{vd.probability:.2f}' if vd.probability is not None else ' -- '
-            print(f'   {MARKS[decision]} {prob} {vd.level or vd.error:<14} {v.title}')
+            print(f'   {MARKS[decision]} {prob} {vd.error} {v.title}')
     if args.save:
         write_snapshot(args.save, snapshot, with_verdicts=classifier is not None)
         print(f'Сохранено {len(snapshot)} вакансий → {Path(args.save).resolve()}')

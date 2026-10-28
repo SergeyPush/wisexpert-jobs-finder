@@ -11,30 +11,14 @@ from .sources import Vacancy
 RETRIES = 2
 RETRY_DELAY = 5.0  # секунд, растёт с каждой попыткой
 
-LEVEL_QUESTION = {
-    'type': 'choice',
-    'name': 'level',
-    'instructions': 'Уровень бухгалтерской должности в вакансии.',
-    'choices': [
-        {'value': 'chief', 'description': 'Главный бухгалтер или его заместитель'},
-        {'value': 'accountant', 'description': 'Бухгалтер (любой участок), бухгалтер-кассир, бухгалтер-экономист'},
-        {'value': 'assistant', 'description': 'Помощник бухгалтера, младший бухгалтер, стажёр'},
-        {'value': 'not_accounting', 'description': 'Не бухгалтерская должность'},
-    ],
-}
-
-
 def build_questions(criteria: str) -> list[dict]:
-    """Главный вопрос — «вакансия подходит под все критерии из criteria.md»; уровень — справочно для CSV."""
+    """Один вопрос — «вакансия подходит под все критерии из criteria.md».
+    Вопроса об уровне должности нет — экономия ~20% токенов на запрос."""
     return [
         {'type': 'predicate', 'name': 'matches',
          'instructions': ('Вакансия (текст на украинском или русском) подходит под ВСЕ критерии ниже.\n\n'
                           f'{criteria}')},
-        LEVEL_QUESTION,
     ]
-
-
-LEVELS = {'chief': 'главбух/зам', 'accountant': 'бухгалтер', 'assistant': 'помощник', 'not_accounting': 'не бухгалтер'}
 
 
 class ClassifierError(RuntimeError):
@@ -44,7 +28,6 @@ class ClassifierError(RuntimeError):
 @dataclass
 class Verdict:
     probability: float | None  # None — классификатор не ответил (ошибка или отказ)
-    level: str = ''
     error: str = ''
 
     def decision(self, keep: float, drop: float) -> str:
@@ -93,10 +76,10 @@ class DecisionsClassifier:
                 # Сбой не временный или повторы кончились — остановка всей работы, а не ошибка на каждую вакансию.
                 raise ClassifierError(f'{type(exc).__name__}: {exc}'[:300]) from exc
         answers = {a.name: a for a in resp.answers}
-        pred, level = answers.get('matches'), answers.get('level')
+        pred = answers.get('matches')
         if pred is None or pred.type == 'refusal':
             return Verdict(None, error='классификатор отказался отвечать')
-        return Verdict(pred.probability, LEVELS.get(level.choice, '') if level is not None and level.type == 'choice' else '')
+        return Verdict(pred.probability)
 
     def classify_many(self, vacancies: list[Vacancy]) -> dict[str, Verdict]:
         """Один запрос на вакансию, параллельно в несколько потоков.

@@ -6,10 +6,10 @@ import re
 import time
 from pathlib import Path
 
-HEADER = ['Найдено', 'Опубликовано', 'Сайт', 'Город', 'Должность', 'Компания', 'Зарплата', 'Уровень', 'Вероятность',
+HEADER = ['Найдено', 'Опубликовано', 'Сайт', 'Город', 'Должность', 'Компания', 'Зарплата', 'Вероятность',
           'Кратко', 'Решил', 'Ссылка']
 # В Google Sheets служебные колонки классификатора не показываются — они остаются только в CSV.
-SHEET_HEADER = [c for c in HEADER if c not in ('Уровень', 'Вероятность', 'Решил')]
+SHEET_HEADER = [c for c in HEADER if c not in ('Вероятность', 'Решил')]
 # Лист/файл отсеянных: все колонки; «Решил» там — «Статус» (отброшена / спорная).
 RENAMED = {'Статус': 'Решил'}  # колонка листа → колонка HEADER, откуда берётся значение
 DROPPED_HEADER = ['Статус' if c == 'Решил' else c for c in HEADER]
@@ -60,7 +60,7 @@ def make_row(now, vac, verdict, summary: str, decided_by: str) -> list[str]:
     """Строка CSV/таблицы. verdict — Verdict классификатора или None, если решал не он."""
     prob = f'{verdict.probability:.2f}' if verdict is not None and verdict.probability is not None else ''
     return [now.strftime('%Y-%m-%d %H:%M'), vac.posted.replace('T', ' ')[:16], vac.source, vac.city, vac.title,
-            vac.company, vac.salary, verdict.level if verdict else '', prob, summary.strip(), decided_by, vac.url]
+            vac.company, vac.salary, prob, summary.strip(), decided_by, vac.url]
 
 
 def safe(value: str) -> str:
@@ -241,7 +241,7 @@ class CsvStore:
 
 
 SNAPSHOT_HEADER = ['Сайт', 'Город', 'Опубликовано', 'Должность', 'Компания', 'Зарплата', 'Кратко', 'Ссылка']
-VERDICT_HEADER = ['Вероятность', 'Уровень', 'Решение', 'Ошибка']
+VERDICT_HEADER = ['Вероятность', 'Решение', 'Ошибка']
 
 
 def write_snapshot(path: str, items: list, with_verdicts: bool) -> None:
@@ -257,5 +257,5 @@ def write_snapshot(path: str, items: list, with_verdicts: bool) -> None:
                    vac.snippet, vac.url]
             if with_verdicts:
                 prob = f'{verdict.probability:.2f}' if verdict.probability is not None else ''
-                row += [prob, verdict.level, decision, verdict.error]
+                row += [prob, decision, verdict.error]
             w.writerow([safe(c) for c in row])

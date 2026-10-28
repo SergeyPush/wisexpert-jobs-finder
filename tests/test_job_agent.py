@@ -5,7 +5,7 @@ from pathlib import Path
 
 from job_agent.config import KYIV
 from job_agent.sources import parse_robota_search, parse_work_listing, within
-from job_agent.storage import CsvStore
+from job_agent.storage import HEADER, CsvStore
 
 NOW = datetime(2026, 10, 20, 22, 0, tzinfo=KYIV)
 
@@ -89,7 +89,7 @@ class StorageTest(unittest.TestCase):
     def test_csv_store_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             store = CsvStore(str(Path(d) / 'jobs.csv'))
-            store.append([['a', 'b', 'c', 'd', '=HYPERLINK()', 'f', 'g', '', '', 'h', 'классификатор', 'https://x/1']])
+            store.append([['a', 'b', 'c', 'd', '=HYPERLINK()', 'f', 'g', '', 'h', 'классификатор', 'https://x/1']])
             self.assertEqual(store.known_ids(), {'https://x/1'})
             self.assertIn("'=HYPERLINK()", (Path(d) / 'jobs.csv').read_text(encoding='utf-8-sig'))
 
@@ -113,7 +113,7 @@ class FakeClassifier:
 
     def classify_many(self, vacancies):
         from job_agent.classifier import Verdict
-        return {v.key: Verdict(self.probs[v.key], 'бухгалтер') for v in vacancies}
+        return {v.key: Verdict(self.probs[v.key]) for v in vacancies}
 
 
 class ClassifierTest(unittest.TestCase):
@@ -127,14 +127,14 @@ class ClassifierTest(unittest.TestCase):
         from unittest import mock
 
         from job_agent.classifier import DecisionsClassifier
-        resp = NS(answers=[NS(name='matches', type='predicate', probability=0.91),
-                           NS(name='level', type='choice', choice='chief')])
+        resp = NS(answers=[NS(name='matches', type='predicate', probability=0.91)])
         with mock.patch('openai.OpenAI') as cls:
             cls.return_value.decisions.create.return_value = resp
             c = DecisionsClassifier('Только удалённая работа.')
             v = c.classify(self.vacs[0])
             kwargs = cls.return_value.decisions.create.call_args.kwargs
-        self.assertEqual((v.probability, v.level, v.decision(0.8, 0.2)), (0.91, 'главбух/зам', 'keep'))
+        self.assertEqual((v.probability, v.decision(0.8, 0.2)), (0.91, 'keep'))
+        self.assertEqual([q['name'] for q in kwargs['questions']], ['matches'])  # вопроса об уровне нет
         self.assertEqual(kwargs['model'], 'gpt-6-luna')
         self.assertIn('Должность: Бухгалтер', kwargs['input'])
         # Критерии из criteria.md попадают в главный вопрос.
@@ -214,7 +214,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((total['found'], total['saved'], total['review'], total['dropped']), (4, 1, 1, 1))
         self.assertIn('новых 3', report[0])
         # Отсеянная — на отдельном листе, с вероятностью и статусом.
-        self.assertEqual([(r[8], r[-2], r[-1]) for r in store.dropped],
+        self.assertEqual([(r[HEADER.index('Вероятность')], r[-2], r[-1]) for r in store.dropped],
                          [('0.10', 'отброшена', 'https://www.work.ua/jobs/2/')])
 
     def test_classifier_error_kept_even_with_drop(self):
@@ -305,13 +305,13 @@ class SnapshotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             raw, scored = Path(d) / 'before.csv', Path(d) / 'after.csv'
             write_snapshot(str(raw), [(vac, None, '')], with_verdicts=False)
-            write_snapshot(str(scored), [(vac, Verdict(0.93, 'главбух/зам'), 'подходит')], with_verdicts=True)
+            write_snapshot(str(scored), [(vac, Verdict(0.93), 'подходит')], with_verdicts=True)
             raw_rows = list(csv.reader(raw.read_text(encoding='utf-8-sig').splitlines()))
             scored_rows = list(csv.reader(scored.read_text(encoding='utf-8-sig').splitlines()))
         self.assertEqual(raw_rows[0][-1], 'Ссылка')
         self.assertEqual(raw_rows[1][-1], vac.url)
-        self.assertEqual(scored_rows[0][-4:], ['Вероятность', 'Уровень', 'Решение', 'Ошибка'])
-        self.assertEqual(scored_rows[1][-4:], ['0.93', 'главбух/зам', 'подходит', ''])
+        self.assertEqual(scored_rows[0][-3:], ['Вероятность', 'Решение', 'Ошибка'])
+        self.assertEqual(scored_rows[1][-3:], ['0.93', 'подходит', ''])
 
 
 def work_card(job_id, when=None, title='Бухгалтер', hot_date=None):
@@ -474,7 +474,7 @@ class SafetyTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {'gspread': gspread}):
             sheet = GoogleSheet('id', 'creds.json')
         ws.update.assert_called_once_with([SHEET_HEADER], 'A1')
-        for col in ('Уровень', 'Вероятность', 'Решил'):
+        for col in ('Вероятность', 'Решил'):
             self.assertNotIn(col, SHEET_HEADER)
         sheet.append([HEADER])  # строка-образец: значение = имя колонки
         self.assertEqual(ws.append_rows.call_args[0][0], [SHEET_HEADER])
