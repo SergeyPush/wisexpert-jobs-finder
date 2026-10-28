@@ -95,16 +95,17 @@ def worksheet_ids(ws, header: list[str]) -> set[str]:
     return {vacancy_id(u) for u in ws.col_values(header.index('Ссылка') + 1)[1:] if u}
 
 
-def append_to_worksheet(ws, header: list[str], rows: list[list[str]]) -> None:
-    """Строки, собранные под HEADER, → лист с колонками header. С повторами при сбоях и без дублей."""
+def append_to_worksheet(ws, header: list[str], rows: list[list[str]]) -> int | None:
+    """Строки, собранные под HEADER, → лист с колонками header. С повторами при сбоях и без дублей.
+    Возвращает номер первой записанной строки листа (None — ничего не записано или номер неизвестен)."""
     if not rows:
-        return
+        return None
     # Оставляем только колонки листа, в его порядке.
     cols = [HEADER.index(RENAMED.get(c, c)) for c in header]
     values = [[safe(r[i]) for i in cols] for r in rows]
     link = header.index('Ссылка')
 
-    def write(attempt: int) -> None:
+    def write(attempt: int):
         pending = values
         if attempt:
             # Таймаут не значит, что строки не записались: уже попавшие в лист не дублируем.
@@ -112,9 +113,30 @@ def append_to_worksheet(ws, header: list[str], rows: list[list[str]]) -> None:
             pending = [r for r in values if vacancy_id(r[link]) not in saved]
         if pending:
             # RAW — значения пишутся как есть, без интерпретации формул.
-            ws.append_rows(pending, value_input_option='RAW')
+            return ws.append_rows(pending, value_input_option='RAW')
+        return None
 
-    sheets_retry(write)
+    return first_row(sheets_retry(write))
+
+
+def first_row(response) -> int | None:
+    """Номер первой строки из ответа append_rows: {'updates': {'updatedRange': "'Лист'!A12:I15"}}."""
+    if not isinstance(response, dict):
+        return None
+    m = re.search(r'![A-Z]+(\d+)', response.get('updates', {}).get('updatedRange', ''))
+    return int(m.group(1)) if m else None
+
+
+def mark_run_start(ws, row: int | None, header: list[str]) -> None:
+    """Жирная линия над первой строкой запуска — видно, где начинается каждый поиск. Только оформление:
+    лишних строк нет, сортировка и дедупликация не ломаются. Сбой оформления запуск не останавливает."""
+    if row is None:
+        return
+    last_col = chr(ord('A') + len(header) - 1)  # колонок меньше 26
+    try:
+        sheets_retry(lambda _: ws.format(f'A{row}:{last_col}{row}', {'borders': {'top': {'style': 'SOLID_THICK'}}}))
+    except Exception as exc:
+        print(f'Google Sheets: линия-разделитель не поставлена ({type(exc).__name__}: {exc})', flush=True)
 
 
 class GoogleSheet:
@@ -130,6 +152,7 @@ class GoogleSheet:
         self.archive = [book.worksheet(name) for name in archive]  # нет листа — ошибка сразу
         self.ws = open_worksheet(book, worksheet, SHEET_HEADER, gspread.WorksheetNotFound)
         self.dropped_ws = open_worksheet(book, dropped, DROPPED_HEADER, gspread.WorksheetNotFound) if dropped else None
+        self.marked = []  # листы, где первая строка этого запуска уже отделена линией
 
     def known_ids(self) -> set[str]:
         """Уже сохранённые и уже отсеянные вакансии: ни те, ни другие повторно не классифицируются."""
@@ -141,11 +164,18 @@ class GoogleSheet:
         return ids
 
     def append(self, rows: list[list[str]]) -> None:
-        append_to_worksheet(self.ws, SHEET_HEADER, rows)
+        self.write(self.ws, SHEET_HEADER, rows)
 
     def append_dropped(self, rows: list[list[str]]) -> None:
         if self.dropped_ws is not None:
-            append_to_worksheet(self.dropped_ws, DROPPED_HEADER, rows)
+            self.write(self.dropped_ws, DROPPED_HEADER, rows)
+
+    def write(self, ws, header: list[str], rows: list[list[str]]) -> None:
+        """Дописать строки; первая запись запуска в лист отделяется линией (append зовётся на каждый сайт × город)."""
+        row = append_to_worksheet(ws, header, rows)
+        if row is not None and ws not in self.marked:
+            self.marked.append(ws)
+            mark_run_start(ws, row, header)
 
 
 def archive_ids(rows: list[list[str]], title: str) -> set[str]:

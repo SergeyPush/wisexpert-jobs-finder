@@ -238,6 +238,42 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(store.rows[0][-2], 'проверить')
         self.assertEqual(total['dropped'], 0)
 
+    def test_title_filter_skips_classifier(self):
+        import job_agent.pipeline as pipeline
+        from job_agent.sources import Vacancy
+        mk = lambda i, t: Vacancy(f'work:{i}', 'work.ua', 'Киев', t, 'Ко', '', '2026-10-20T10:00+03:00',
+                                  f'https://www.work.ua/jobs/{i}/', '')
+        vacs = [mk(1, 'Бухгалтер'), mk(2, 'Бухгалтер-касир'), mk(3, 'Фінансовий менеджер'), mk(4, 'Головбух')]
+        clf = FakeClassifier({'work:1': 0.9, 'work:4': 0.9})  # 2 и 3 сюда не должны попасть — иначе KeyError
+        store = FakeStore()
+        original = pipeline.search
+        pipeline.search = lambda *a: vacs
+        try:
+            _, total = pipeline.run_classifier(store, ['Киев'], ['work.ua'], NOW, clf, fetcher=None,
+                                               title_filter={'stop': ['касир'], 'required': ['бухгалт', 'головбух']})
+        finally:
+            pipeline.search = original
+        self.assertEqual((total['saved'], total['dropped'], total['stopped']), (2, 2, 2))
+        self.assertEqual([r[-2] for r in store.dropped], ['стоп-слово «касир»', 'нет обязательного слова'])
+
+    def test_title_rejected_word_start(self):
+        from job_agent.pipeline import title_rejected
+        f = {'stop': ['касир', 'молодш'], 'required': []}
+        self.assertEqual(title_rejected('Молодший бухгалтер', f), 'стоп-слово «молодш»')
+        self.assertIsNone(title_rejected('Бухгалтерасир', f))  # не с начала слова — не стоп
+        self.assertIsNone(title_rejected('Бухгалтер', None))
+
+    def test_load_title_filter(self):
+        from job_agent.config import load_title_filter
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'f.txt'
+            p.write_text('# заметка\n[стоп]\nКасир  # комментарий\nУчётчик\n\n[обязательные]\nбухгалт\n', encoding='utf-8')
+            self.assertEqual(load_title_filter(str(p)), {'stop': ['касир', 'учетчик'], 'required': ['бухгалт']})
+            self.assertEqual(load_title_filter(str(Path(d) / 'нет.txt')), {'stop': [], 'required': []})
+            p.write_text('касир\n', encoding='utf-8')
+            with self.assertRaises(SystemExit):  # слово вне секции
+                load_title_filter(str(p))
+
     def test_review_dropped(self):
         store, _, total = self.run_pipeline('drop')
         self.assertEqual(len(store.rows), 1)
@@ -442,6 +478,26 @@ class SafetyTest(unittest.TestCase):
             self.assertNotIn(col, SHEET_HEADER)
         sheet.append([HEADER])  # строка-образец: значение = имя колонки
         self.assertEqual(ws.append_rows.call_args[0][0], [SHEET_HEADER])
+
+    def test_sheet_run_separator_once_per_run(self):
+        import sys
+        from unittest import mock
+
+        from job_agent.storage import HEADER, SHEET_HEADER, GoogleSheet
+        ws = mock.MagicMock()
+        ws.row_values.return_value = SHEET_HEADER
+        # Ответы append_rows: первая пачка запуска с 12-й строки, вторая (другой город) — с 14-й.
+        ws.append_rows.side_effect = [{'updates': {'updatedRange': "'Вакансии'!A12:I13"}},
+                                      {'updates': {'updatedRange': "'Вакансии'!A14:I14"}}]
+        gspread = mock.MagicMock()
+        gspread.service_account.return_value.open_by_key.return_value.worksheet.return_value = ws
+        with mock.patch.dict(sys.modules, {'gspread': gspread}):
+            sheet = GoogleSheet('id', 'creds.json')
+        sheet.append([])  # пустая пачка — ни записи, ни линии
+        sheet.append([HEADER, HEADER])
+        sheet.append([HEADER])
+        # Линия одна — над первой строкой запуска, на всю ширину листа.
+        ws.format.assert_called_once_with('A12:I12', {'borders': {'top': {'style': 'SOLID_THICK'}}})
 
     def test_sheet_append_retries_without_duplicates(self):
         import sys

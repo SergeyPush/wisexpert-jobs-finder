@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .config import CITIES, KYIV, SOURCES, env, load_criteria, load_dotenv
+from .config import CITIES, KYIV, SOURCES, env, load_criteria, load_dotenv, load_title_filter
 from .sources import Fetcher
 from .notify import notify, send_telegram, telegram_configured
 from .storage import CsvStore, GoogleSheet, write_snapshot
@@ -28,10 +28,12 @@ def check_sources(args, now: datetime) -> int:
     """Проверка без сохранения: сколько вакансий видно в каждом источнике.
     С --classify ещё и показывает решения классификатора — для подбора критериев и порогов.
     С --save пишет все найденные вакансии (и решения, если --classify) в CSV — для сравнения «до и после»."""
-    from .pipeline import search_all
+    from .classifier import Verdict
+    from .pipeline import search_all, title_rejected
 
     fetcher = Fetcher(delay=args.delay, proxy=env('PROXY_URL'))
     classifier = make_classifier() if args.classify else None
+    title_filter = load_title_filter()
     snapshot = []  # (вакансия, Verdict или None, решение)
     failed = False
     for source, city, found, exc in search_all(fetcher, args.sources, args.cities, now, args.max_pages,
@@ -46,6 +48,13 @@ def check_sources(args, now: datetime) -> int:
             for v in found[:3]:
                 print(f'   {v.posted} {v.title} — {v.company}')
             continue
+        # Отсеянные по названию — без запроса к классификатору, как в основном запуске.
+        rejected = {v.key: why for v in found if (why := title_rejected(v.title, title_filter))}
+        for v in found:
+            if v.key in rejected:
+                snapshot.append((v, Verdict(None), rejected[v.key]))  # пустой вердикт: классификатор не спрашивали
+                print(f'   ✘ {rejected[v.key]:<26} {v.title}')
+        found = [v for v in found if v.key not in rejected]
         try:
             verdicts = classifier.classify_many(found)
         except Exception as exc:  # неверный ключ, нет доступа к модели — дальше проверять бессмысленно
@@ -144,13 +153,13 @@ def search_and_save(args, now: datetime, parser) -> tuple[int, list[str], str]:
         _, total = run_classifier(store, args.cities, args.sources, now, classifier,
                                   fetcher=Fetcher(delay=args.delay, proxy=env('PROXY_URL')),
                                   max_pages=args.max_pages, review=review, verbose=args.verbose,
-                                  retry_wait=args.retry_wait)
+                                  retry_wait=args.retry_wait, title_filter=load_title_filter())
     except ClassifierError as exc:  # неверный ключ, нет кредитов, нет доступа к модели
         return fail(f'Ошибка классификатора: {exc}')
     except Exception as exc:  # запись в Google Sheets/CSV не удалась и после повторов, прочие сбои
         return fail(f'Запуск остановлен ({type(exc).__name__}): {exc}')
     summary = (f"[{now:%Y-%m-%d %H:%M}] Подходит: {total['saved']}, проверить: {total['review']}, "
-               f"отброшено: {total['dropped']} из {total['found']} → {target}")
+               f"отброшено: {total['dropped']} (по названию {total['stopped']}) из {total['found']} → {target}")
     print(summary)
     return (1 if total['errors'] else 0), total['problems'], summary
 

@@ -1,9 +1,11 @@
-"""Конвейер: сбор → классификатор (Decisions API) → CSV. Решение «подходит / нет» по criteria.md."""
+"""Конвейер: сбор → стоп-слова → классификатор (Decisions API) → CSV. Решение «подходит / нет» по criteria.md."""
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 
+from .config import normalize
 from .sources import Fetcher, SourceError, search
 from .storage import make_row, vacancy_id
 
@@ -25,6 +27,21 @@ def suspicious_zeros(found_by: dict[tuple[str, str], int], sources: list[str], c
         elif counts.get(BIG_CITY) == 0:
             warnings.append(f'{source}: 0 вакансий в городе {BIG_CITY} — похоже на сбой источника')
     return warnings
+
+
+def title_rejected(title: str, title_filter: dict[str, list[str]] | None) -> str | None:
+    """Почему вакансия отсеяна по названию (статус для листа «Отсеянные»); None — пропускаем к классификатору.
+    title_filter — {'stop': [...], 'required': [...]} из load_title_filter, слова уже нормализованы."""
+    if not title_filter:
+        return None
+    title = normalize(title)
+    # (?<!\w) — совпадение только с начала слова: «касир» ловит «бухгалтер-касир», но не середину слова.
+    has = lambda w: re.search(r'(?<!\w)' + re.escape(w), title)
+    if stop := next((w for w in title_filter['stop'] if has(w)), None):
+        return f'стоп-слово «{stop}»'
+    if title_filter['required'] and not any(has(w) for w in title_filter['required']):
+        return 'нет обязательного слова'
+    return None
 
 
 def search_all(fetcher: Fetcher, sources: list[str], cities: list[str], now: datetime, max_pages: int,
@@ -57,11 +74,12 @@ def search_all(fetcher: Fetcher, sources: list[str], cities: list[str], now: dat
 
 def run_classifier(store, cities: list[str], sources: list[str], now: datetime, classifier, *, fetcher: Fetcher,
                    max_pages: int = 30, review: str = 'save', verbose: bool = False,
-                   retry_wait: float = 0) -> tuple[list[str], dict]:
+                   retry_wait: float = 0, title_filter: dict | None = None) -> tuple[list[str], dict]:
     """Возвращает (строки отчёта по каждому сайту и городу, общие счётчики).
-    total['problems'] — ошибки источников и предупреждения о подозрительном нуле, для уведомления."""
+    total['problems'] — ошибки источников и предупреждения о подозрительном нуле, для уведомления.
+    title_filter — стоп-/обязательные слова: не прошедшие по названию отсеиваются без запроса к классификатору."""
     known = store.known_ids()
-    total = {'found': 0, 'saved': 0, 'review': 0, 'dropped': 0, 'errors': 0, 'problems': []}
+    total = {'found': 0, 'saved': 0, 'review': 0, 'dropped': 0, 'stopped': 0, 'errors': 0, 'problems': []}
     found_by: dict[tuple[str, str], int] = {}
     report = []
     for source, city, found, exc in search_all(fetcher, sources, cities, now, max_pages, retry_wait):
@@ -74,9 +92,18 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
             continue
         found_by[(source, city)] = len(found)
         fresh = [v for v in found if vacancy_id(v.url) not in known]
-        verdicts = classifier.classify_many(fresh)
+        # Не прошла фильтр по названию — отсеиваем сразу, токены классификатора на неё не тратятся.
+        stopped = {v.key: why for v in fresh if (why := title_rejected(v.title, title_filter))}
+        verdicts = classifier.classify_many([v for v in fresh if v.key not in stopped])
         rows, dropped, counts = [], [], {'keep': 0, 'review': 0, 'drop': 0}
         for v in fresh:
+            if v.key in stopped:
+                known.add(vacancy_id(v.url))
+                counts['drop'] += 1
+                if verbose:
+                    print(f'   ✘ {stopped[v.key]}: {v.title} — {v.company}', flush=True)
+                dropped.append(make_row(now, v, None, v.snippet, stopped[v.key]))
+                continue
             vd = verdicts[v.key]
             decision = original = vd.decision(classifier.keep, classifier.drop)
             # Без ответа классификатора (сбой, отказ) вакансию не выбрасываем: завтра она уже вне 24 часов.
@@ -96,13 +123,16 @@ def run_classifier(store, cities: list[str], sources: list[str], now: datetime, 
             rows.append(make_row(now, v, vd, v.snippet, 'классификатор' if decision == 'keep' else 'проверить'))
         store.append(rows)
         store.append_dropped(dropped)
-        errors = sum(1 for v in fresh if verdicts[v.key].error)
+        errors = sum(1 for vd in verdicts.values() if vd.error)
         total['found'] += len(found)
         total['saved'] += counts['keep']
         total['review'] += counts['review']
         total['dropped'] += counts['drop']
+        total['stopped'] += len(stopped)
         line = (f'{source} · {city}: найдено {len(found)}, новых {len(fresh)} → подходит {counts["keep"]}, '
                 f'проверить {counts["review"]}, отброшено {counts["drop"]}')
+        if stopped:
+            line += f' (из них по названию {len(stopped)})'
         if errors:
             line += f' (без ответа классификатора: {errors})'
             total['problems'].append(line)  # лимиты/сбои API: вакансии сохранены как «проверить»

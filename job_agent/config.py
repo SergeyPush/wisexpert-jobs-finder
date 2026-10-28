@@ -54,3 +54,34 @@ def load_criteria(path: str = '') -> str:
     if not criteria:
         raise SystemExit(f'{file}: критерии пустые')
     return criteria
+
+
+def normalize(text: str) -> str:
+    """Для сравнения стоп-слов: нижний регистр, ё = е."""
+    return text.lower().replace('ё', 'е')
+
+
+TITLE_SECTIONS = {'[стоп]': 'stop', '[обязательные]': 'required'}
+
+
+def load_title_filter(path: str = '') -> dict[str, list[str]]:
+    """Фильтр по названию из title-filter.txt (или TITLE_FILTER_FILE): {'stop': [...], 'required': [...]}.
+    Секции [стоп] и [обязательные], по слову на строку, # — комментарий. Нет файла — фильтра нет."""
+    file = Path(path or env('TITLE_FILTER_FILE') or ROOT / 'title-filter.txt')
+    words: dict[str, list[str]] = {'stop': [], 'required': []}
+    if not file.exists():
+        return words
+    section = None
+    for line in file.read_text(encoding='utf-8').splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith('['):
+            if line.lower() not in TITLE_SECTIONS:
+                raise SystemExit(f'{file}: неизвестная секция {line}, нужны {", ".join(TITLE_SECTIONS)}')
+            section = TITLE_SECTIONS[line.lower()]
+        elif section is None:
+            raise SystemExit(f'{file}: слово «{line}» вне секции — начните с [стоп] или [обязательные]')
+        else:
+            words[section].append(normalize(line))
+    return words
